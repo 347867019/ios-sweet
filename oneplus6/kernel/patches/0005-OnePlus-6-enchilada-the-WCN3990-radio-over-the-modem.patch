@@ -1,0 +1,3004 @@
+From 5a63c0fd4984bf4a73122263ee59466371255015 Mon Sep 17 00:00:00 2001
+From: oxjmo <oxjmo@localhost>
+Date: Sat, 31 Oct 2026 05:45:06 +0000
+Subject: [PATCH 5/7] OnePlus 6 (enchilada): the WCN3990 radio over the modem
+ PIL path
+
+redwood_wcn3990.c drives the radio as a remote processor: RPMh rail
+votes, GCC clocks, reset line, then MBA/MPSS segments through the QMP
+doorbells. What the probes settled across the m24-m30 series: the door-
+bell word write from an EL1 AP silently vanishes (read-back stays at
+its old value, no abort), a byte write on the same page takes the whole
+machine down, and the behavior is identical from the ABL fastboot chain
+and from a normal boot, so the difference to Android lies in the boot
+chain's TZ setup, not in the EL. redwood_pcie.c is the archived root
+complex probe that showed the radio lives on the SNOC, not PCIe.
+---
+ xnu/files/bsd/dev/redwood_input.c   |    2 +
+ xnu/files/bsd/dev/redwood_pcie.c    |  912 ++++++++++++
+ xnu/files/bsd/dev/redwood_wcn3990.c | 2027 +++++++++++++++++++++++++++
+ xnu/files/bsd/sys/redwood_input.h   |    2 +
+ 4 files changed, 2943 insertions(+)
+ create mode 100644 xnu/files/bsd/dev/redwood_pcie.c
+ create mode 100644 xnu/files/bsd/dev/redwood_wcn3990.c
+
+diff --git a/xnu/files/bsd/dev/redwood_input.c b/xnu/files/bsd/dev/redwood_input.c
+index ae67988..81b7932 100644
+--- a/xnu/files/bsd/dev/redwood_input.c
++++ b/xnu/files/bsd/dev/redwood_input.c
+@@ -224,6 +224,8 @@ redwood_input_init(void)
+ 	redwood_net_init();
+ 	redwood_usb_init();
+ 	redwood_adreno_init();
++	redwood_pcie_init();
++	redwood_wcn3990_init();
+ 	redwood_wifi_init();
+ 	redwood_adsp_init();
+ }
+diff --git a/xnu/files/bsd/dev/redwood_pcie.c b/xnu/files/bsd/dev/redwood_pcie.c
+new file mode 100644
+index 0000000..47dfd0c
+--- /dev/null
++++ b/xnu/files/bsd/dev/redwood_pcie.c
+@@ -0,0 +1,912 @@
++/*
++ * The PCIe root complex of the OnePlus 6 (sdm845), on which the phone's Wi-Fi lives: a
++ * Qualcomm WCN3990, a radio that does not sit behind any DSP -- the host talks to it over
++ * PCIe and loads its firmware itself. Everything below was learned from the phone's Android
++ * device tree, the mainline Qualcomm PCIe driver (drivers/pci/controller/dwc/pcie-qcom.c,
++ * the ops for the "1.9.0" hardware, which is what this controller is) and its QMP v3 PHY
++ * driver (drivers/phy/qualcomm/phy-qcom-qmp-pcie.c, sdm845 tables) -- and, in the
++ * vendor device tree, the PHY's init sequence written out as raw register writes, which
++ * matches the mainline tables value for value.
++ *
++ * Hardware (the device tree's numbers; the address of the PCIe block):
++ *
++ *   parf      0x1c00000       the Qualcomm side of the controller ("PARF", 8 KiB)
++ *   PHY       0x1c06000       a QMP v3 serdes/tx/rx/pcs/pcs_misc lane, 4 KiB
++ *   dm_core   0x60000000      the controller's own (DesignWare) config space, "dbi"
++ *   elbi      0x60000f20      its interrupt block ("elbi"), inside the same page
++ *   conf      0x60100000      1 MiB of config space at (bus << 20 | dev << 15 | fn << 12)
++ *   io        0x60200000      (not used here)
++ *   bars      0x60300000, 13 MiB   (not used here)
++ *   perst     GPIO 35, wake GPIO 37 (both on the TLMM's south tile; the GPIO drives
++ *             the device's PERST# through the board's buffer: HIGH holds the device
++ *             in reset, and the device starts link training when it goes LOW -- which
++ *             is how the mainline driver with this device tree's "perst-gpio" flag
++ *             behaves: it drives the line HIGH through the bring-up and LOW 100 ms
++ *             before the link is asked to train)
++ *   supplies  from the PM8998, asked for by vote in RPMh by name: 1.2 V from "ldoa26",
++ *             0.88 V from "ldoa1" (the device tree's vreg-1.8 / vreg-0.9 -- the PCIe
++ *             lane's analog supply and the PHY's digital one); the system's "cx" arc
++ *             is left to the boot loader, as it is everywhere else here
++ *   clocks    the GCC block: a GDSC ("pcie_0"), six clock-enable votes, five clock
++ *             gates, two RCGs (the PHY's 19.2 MHz "aux" from the tcxo, the PHY's
++ *             "refgen" at 100 MHz from GPLL0), a "clkref" gate and three resets
++ *             (the address of every one below was cross-checked against the
++ *             downstream clock driver's definitions for the same registers)
++ *   MSI       the GICv2m frame at 0x17a00040, SPI 704.. -- not wired yet (a later step)
++ *   SMMU      the radio's DMA flows have sids 0x1c10.. -- not touched yet either: with
++ *             the device tree's iommu-map, bus 0-15 device 0 map to sid 0x1c10 + bus,
++ *             and the translation table here is programmed accordingly (but flows
++ *             only start once the radio asks for its memory)
++ *
++ * The bring-up is one step after another, in the mainline driver's order:
++ *
++ *   1  mapped        the blocks mapped (a look, no reads yet)
++ *   2  probe tlmm    the pins read, known safe ground
++ *   3  perst         the device held in reset (GPIO 35 HIGH) through the whole bring-up
++ *   4  probe gcc     the clock block read AS FOUND (it has no gate of its own): whether the
++ *                    domain was left on, and what its votes were
++ *   5  supplies      ldoa26 to 1.2 V and ldoa1 to 0.88 V, both HPM, one RPMh write at a time
++ *   6  clocks        both RCGs, the GDSC on, the six votes on, every gate polled to open,
++ *                    the "clkref" gate on
++ *   7  resets        the controller's core and PHY reset, 1 ms each way
++ *   8-11  probe ...  parf, dbi, conf, the PHY read one step each -- ONLY NOW, powered and
++ *                    clocked (a cold block's read can hang the bus; every register named in
++ *                    the log before its read goes, so a trapped read is not anonymous)
++ *   12 parf          the mainline init sequence of the 1.9.0 controller (its registers,
++ *                    from DEVICE_TYPE to the AXI master's write-halt)
++ *   13 phy           the QMP v3 lane: tables in, reset out, started, "PHYSTATUS" waited to
++ *                    clear
++ *   14 perst         the device let go (100 ms held first, then LOW, 1 ms, as the driver has
++ *                    it)
++ *   15 sid           the SMMU translation table filled: every bus's device 0 to its sid, the
++ *                    table's BDF hash and all, and translation turned on
++ *   16 ltssm         equalization left alone (the device tree's hardware does its own), the
++ *                    link asked to train, then "Data Link Layer Link Active" waited for,
++ *                    one second
++ *   17 enumerate     the config space at (0,0,0) read out -- the radio answers there (the
++ *                    vendor kernel's "boot option 1": a transparent root, the endpoint in
++ *                    the same 1 MiB window), and this step looks for vendor 0x17cb device
++ *                    0x1101
++ *
++ * The order the driver works in: every step prints what it does and what it read, and
++ * stops the bring-up when it did not get what it expected.
++ *
++ * Boot-args:
++ *
++ *   pcie=1         run the bring-up (nothing below this driver happens without it)
++ *   pcie_step=N    stop after step N (for finding the step that kills a run)
++ *   pcie_slow=1    8 s between the steps (runs die faster than the host reads the log;
++ *                  the gaps let every line through -- the touch screen's driver's trick)
++ */
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <pexpert/pexpert.h>
++#include <sys/redwood_input.h>
++#include <sys/systm.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern boolean_t ml_get_interrupts_enabled(void);
++extern kern_return_t thread_terminate(thread_t thread);
++extern void loader_log_putc(char c);
++
++static uint32_t level;
++static bool leaving;
++static unsigned step_number, step_limit, slow;
++
++/* every line to the loader's log as well (and to the console when that may be written) */
++static int say(const char *format, ...) __printflike(1, 2);
++
++static int
++say(const char *format, ...)
++{
++	char line[300];
++	va_list list;
++	int length;
++
++	va_start(list, format);
++	length = vsnprintf(line, sizeof(line), format, list);
++	va_end(list);
++	for (const char *c = line; *c != 0; c++) {
++		loader_log_putc(*c);
++	}
++	if (!leaving && ml_get_interrupts_enabled()) {
++		printf("%s", line);
++	}
++	return length;
++}
++
++static inline uint32_t
++rd(vm_offset_t address)
++{
++	return *(volatile uint32_t *)address;
++}
++
++static inline void
++wr(vm_offset_t address, uint32_t value)
++{
++	*(volatile uint32_t *)address = value;
++}
++
++static void
++spin_us(uint32_t us)
++{
++	uint64_t until;
++
++	nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &until);
++	until += mach_absolute_time();
++	while (mach_absolute_time() < until) {
++	}
++}
++
++static void
++wait_ms(uint32_t ms)
++{
++	if (leaving) {
++		spin_us(ms * 1000);
++	} else {
++		delay_for_interval(ms, NSEC_PER_MSEC);
++	}
++}
++
++/* one step of the bring-up; false = a later step was asked for instead */
++static bool
++step(const char *what)
++{
++	step_number++;
++	if (step_limit != 0 && step_number > step_limit) {
++		return false;
++	}
++	say("pcie: step %u: %s\n", step_number, what);
++	if (slow) {
++		say("pcie: -- step %s done, sleeping 8 s --\n", what);
++		wait_ms(8000);
++	}
++	return true;
++}
++
++/* a register named for a step's failure line */
++static void
++show(const char *what, vm_offset_t address)
++{
++	say("pcie: %s at %lx reads %#x\n", what, address, rd(address));
++}
++
++static bool
++poll32(vm_offset_t address, uint32_t mask, uint32_t want, uint32_t ms, const char *what)
++{
++	for (uint32_t i = 0; i < ms * 10; i++) {
++		if ((rd(address) & mask) == want) {
++			return true;
++		}
++		spin_us(100);
++	}
++	say("pcie: TIMEOUT waiting for %s (register %lx: %#x wanted %#x)\n", what, address, rd(address), want);
++	return false;
++}
++
++/* ---- the blocks ------------------------------------------------------------------------------------- */
++
++/* the GCC block: the addresses of everything this driver touches, as the downstream clock
++ * driver spells them (its base is the middle of the sdm845's clock tree at 0x100000) */
++#define GCC_PHYS                0x00100000UL
++#define GCC_SIZE                0x001f0000UL
++#define GCC(reg)                (gcc + (reg) - 0x100000UL)
++
++#define GCC_PCIE_0_GDSCR        0x16b004        /* bit 0 "collapse" clear = on; +4: bit 16 "up" */
++#define GCC_PCIE_0_BCR          0x16b000
++#define GCC_PCIE_0_AUX_CLK_CMD  0x16b028        /* an RCG: bit 31 update; its config is at +0x14 */
++#define GCC_PCIE_0_AUX_CLK_CFG  0x16b03c
++#define GCC_PCIE_0_Q2A_HALT     0x16b00c
++#define GCC_PCIE_0_SLV_HALT     0x16b010
++#define GCC_PCIE_0_MSTR_HALT    0x16b014
++#define GCC_PCIE_0_CFG_HALT     0x16b018
++#define GCC_PCIE_0_AUX_HALT     0x16b01c        /* bit 31 = the clock is off */
++#define GCC_PCIE_0_PHY_BCR      0x16c01c
++#define GCC_PCIE_PHY_REFGEN_CMD 0x16f014
++#define GCC_PCIE_PHY_REFGEN_CFG 0x16f028
++#define GCC_PCIE_PHY_AUX_HALT   0x16f004        /* also its gate enable, bit 0 */
++#define GCC_PCIE_PHY_REFGEN_HALT 0x16f02c       /* ... and its gate enable, bit 0 */
++#define GCC_PCIE_0_CLKREF_EN    0x18c00c        /* bit 0 enable, bit 31 halt (self-gating) */
++#define GCC_PCIE_0_CLK_VOTE     0x15200c        /* the six enable votes, bit 0..5 */
++#define GCC_VOTE_SLV_AXI        (1u << 0)
++#define GCC_VOTE_MSTR_AXI       (1u << 1)
++#define GCC_VOTE_CFG_AHB        (1u << 2)
++#define GCC_VOTE_AUX            (1u << 3)
++#define GCC_VOTE_PIPE           (1u << 4)
++#define GCC_VOTE_SLV_Q2A        (1u << 5)
++#define GCC_RCG_UPDATE          (1u << 31)
++/* config words for the two RCGs: source (bits 10:8) and pre-divided-by (bits 15:12, minus one) */
++#define AUX_CFG_TCXO_19_2MHZ    0x00000000u     /* source 0 = the tcxo, division 1: 19.2 MHz */
++#define REFGEN_CFG_GPLL0_100MHZ 0x00005100u     /* source 1 = gpll0, divide 6: 100 MHz */
++
++#define PARF_PHYS               0x01c00000UL
++#define PARF_SIZE               0x2000UL
++#define PARF(reg)               (parf + (reg))
++#define PARF_SYS_CTRL           0x00            /* bit 29: MAC PHY powerdown in P2 multiplexed */
++#define PARF_PM_CTRL            0x20            /* bit 5: "not entry L1 request" */
++#define PARF_PHY_CTRL           0x40            /* bit 0: the PHY held in test power down */
++#define PARF_LTSSM_STATE        0x1b0           /* bit 8 = "start"; the state in bits 5:0 */
++#define PARF_MHI_CLOCK_RESET    0x174           /* bit 4: the MHI clock bypassed (not from an MHI side) */
++#define PARF_AXI_MSTR_WR_HALT   0x1a8           /* bit 31: the write halt feature on */
++#define PARF_DBI_BASE_V2        0x350           /* the controller's own config space, split in two */
++#define PARF_DBI_BASE_HI_V2     0x354
++#define PARF_SLV_SPACE_V2       0x358           /* where its own config space ends, the bars' base */
++#define PARF_SLV_SPACE_HI_V2    0x35c
++#define PARF_BDF_TO_SID_CFG     0x2c00          /* bit 0: translation on */
++#define PARF_BDF_TO_SID_TABLE   0x2000          /* 256 entries: bdf | sid << 8 | next << 24 */
++#define PARF_DEVICE_TYPE        0x1000          /* 4 = a root port */
++#define MAC_PHY_POWERDOWN_IN_P2_D_MUX_EN        (1u << 29)
++#define REQ_NOT_ENTR_L1         (1u << 5)
++#define PHY_TEST_PWR_DOWN       (1u << 0)
++#define MHI_CLOCK_BYPASS        (1u << 4)
++#define AXI_MSTR_WR_ADDR_HALT_EN (1u << 31)
++#define LTSSM_ENABLE            (1u << 8)
++
++#define DM_CORE_PHYS            0x60000000UL    /* the controller's own (DesignWare) config space */
++#define DM_CORE_SIZE            0x1000UL
++#define DBI(reg)                (dbi + (reg))
++
++#define CONF_PHYS               0x60100000UL    /* (bus << 20 | dev << 15 | fn << 12), 1 MiB: bus 0 */
++#define CONF_SIZE               0x100000UL
++#define CONF(bdf, off)          (conf + ((uint64_t)(bdf) << 20 | (off)))
++
++#define PHY_PHYS                0x01c06000UL    /* the QMP v3 lane */
++#define PHY_SIZE                0x1000UL
++#define SERDES(off)             (phy + (off))
++#define TXRX(off)               (phy + 0x200UL + (off))
++#define PCS(off)                (phy + 0x800UL + (off))
++#define PCS_MISC(off)           (phy + 0x600UL + (off))
++#define PCS_POWER_DOWN_CONTROL  0x004
++#define PCS_START_CONTROL       0x008
++#define PCS_SW_RESET            0x000
++#define PCS_STATUS              0x174
++#define PHYSTATUS               (1u << 6)
++#define SW_PWRDN                (1u << 0)
++#define REFCLK_DRV_DSBL         (1u << 1)
++#define SERDES_START            (1u << 1)
++#define PCS_START_              (1u << 0)
++#define SW_RESET_               (1u << 0)
++
++/* the pins: GPIO 35 is the device's reset, GPIO 37 its wake -- both on the south tile (the
++ * tile logic as the touch screen's driver has it: the pin's GLOBAL number into the tile) */
++#define TLMM_SOUTH_PHYS         0x03d00000UL
++#define TLMM_SOUTH_SIZE         0x80000UL
++#define GPIO_CFG(pin)           (tlmm_south + 0x1000UL * (pin))
++#define GPIO_IO(pin)            (GPIO_CFG(pin) + 4)
++#define CFG_OUTPUT              (1u << 9)
++#define PIN_PERST               35
++#define PIN_WAKE                37
++
++static vm_offset_t gcc, parf, dbi, conf, phy, tlmm_south;
++
++/* ---- RPMh (the supplies), the way every driver on this phone does it -------------------------------- */
++
++#define CMD_DB_SCRATCH_PHYS     0x0c3f000cUL    /* holds the address of the command database */
++#define CMD_DB_SIZE             0x20000UL
++
++#define RSC_PHYS                0x179e0000UL    /* the application processor's "DRV 2" of the RSC at 0x179c0000 */
++#define RSC_SIZE                0x10000UL
++#define TCS(reg)                (rsc + 0xd00 + (reg))
++#define TCS_IRQ_ENABLE          0x00
++#define TCS_IRQ_STATUS          0x04
++#define TCS_IRQ_CLEAR           0x08
++#define TCS_WAIT_FOR_COMPLETION 0x10
++#define TCS_CONTROL             0x14
++#define TCS_CONTROL_ENABLE      (1u << 16)
++#define TCS_CONTROL_TRIGGER     (1u << 24)
++#define TCS_STATUS              0x18
++#define TCS_CMD_ENABLE          0x1c
++#define TCS_CMD_MSGID(n)        (0x30 + 20 * (n))
++#define TCS_CMD_ADDR(n)         (0x34 + 20 * (n))
++#define TCS_CMD_DATA(n)         (0x38 + 20 * (n))
++#define MSGID_WRITE_4_BYTES     0x10008
++#define MSGID_RESPONSE          0x100
++
++#define VRM_VOLTAGE             0               /* a regulator's registers, from its address: millivolts */
++#define VRM_ENABLE              4
++#define VRM_MODE                8
++#define VRM_MODE_LDO_HPM        3
++
++struct cmd_db_slave {
++	uint16_t id, header_offset, data_offset, count, version, reserved[3];
++};
++struct cmd_db_header {
++	uint32_t version;
++	uint8_t magic[4];
++	struct cmd_db_slave slave[8];
++	uint32_t checksum, reserved;
++	uint8_t data[];
++};
++struct cmd_db_entry {
++	char id[8];
++	uint32_t priority[2];
++	uint32_t address;
++	uint16_t length, offset;
++};
++
++static vm_offset_t rsc, cmd_db;
++
++static uint32_t
++rpmh_address(const char *name)
++{
++	const struct cmd_db_header *db = (const struct cmd_db_header *)cmd_db;
++	char id[8] = { 0 };
++
++	if (db->magic[0] != 0xdb || db->magic[1] != 0x30 || db->magic[2] != 0x03 || db->magic[3] != 0x0c) {
++		say("pcie: no command database (magic %02x %02x %02x %02x)\n", db->magic[0], db->magic[1], db->magic[2],
++		    db->magic[3]);
++		return 0;
++	}
++	strlcpy(id, name, sizeof(id));
++	for (unsigned s = 0; s < 8; s++) {
++		const struct cmd_db_slave *slave = &db->slave[s];
++		const struct cmd_db_entry *entry = (const struct cmd_db_entry *)(db->data + slave->header_offset);
++
++		if (slave->id == 0 || slave->header_offset >= CMD_DB_SIZE - 0x1000 || slave->count > 512) {
++			continue;
++		}
++		for (unsigned i = 0; i < slave->count; i++) {
++			if (memcmp(entry[i].id, id, sizeof(id)) == 0) {
++				return entry[i].address;
++			}
++		}
++	}
++	return 0;
++}
++
++static bool
++rpmh_wait(uint32_t reg, uint32_t mask, uint32_t value, const char *what)
++{
++	for (int i = 0; i < 2000; i++) {
++		if ((rd(TCS(reg)) & mask) == value) {
++			return true;
++		}
++		spin_us(100);
++	}
++	say("pcie: RPMh: timeout waiting for %s (register %#x = %#x)\n", what, reg, rd(TCS(reg)));
++	return false;
++}
++
++/* ONE register write to RPMh, waited out (see the touch screen's driver for why one at a time) */
++static bool
++rpmh_write(uint32_t address, uint32_t data, const char *what)
++{
++	uint32_t irq_enable = rd(TCS(TCS_IRQ_ENABLE));
++	bool done;
++
++	for (int i = 0; rd(TCS(TCS_STATUS)) == 0; i++) {
++		if (i > 2000) {
++			say("pcie: RPMh: the command slots stay busy\n");
++			return false;
++		}
++		spin_us(100);
++	}
++	wr(TCS(TCS_CONTROL), rd(TCS(TCS_CONTROL)) & ~TCS_CONTROL_TRIGGER);
++	wr(TCS(TCS_CONTROL), rd(TCS(TCS_CONTROL)) & ~TCS_CONTROL_ENABLE);
++	wr(TCS(TCS_IRQ_CLEAR), 1);
++	wr(TCS(TCS_CMD_MSGID(0)), MSGID_WRITE_4_BYTES | MSGID_RESPONSE);
++	wr(TCS(TCS_CMD_ADDR(0)), address);
++	wr(TCS(TCS_CMD_DATA(0)), data);
++	wr(TCS(TCS_WAIT_FOR_COMPLETION), 1);
++	wr(TCS(TCS_CMD_ENABLE), 1);
++	wr(TCS(TCS_IRQ_ENABLE), irq_enable | 1);
++	wr(TCS(TCS_CONTROL), TCS_CONTROL_ENABLE);
++	wr(TCS(TCS_CONTROL), TCS_CONTROL_ENABLE | TCS_CONTROL_TRIGGER);
++
++	done = rpmh_wait(TCS_IRQ_STATUS, 1, 1, what);
++	wr(TCS(TCS_CONTROL), rd(TCS(TCS_CONTROL)) & ~TCS_CONTROL_TRIGGER);
++	wr(TCS(TCS_CONTROL), rd(TCS(TCS_CONTROL)) & ~TCS_CONTROL_ENABLE);
++	wr(TCS(TCS_CMD_ENABLE), 0);
++	wr(TCS(TCS_WAIT_FOR_COMPLETION), 0);
++	wr(TCS(TCS_IRQ_CLEAR), 1);
++	wr(TCS(TCS_IRQ_ENABLE), irq_enable);
++	return done;
++}
++
++/*
++ * A regulator by its name in the command database: voltage, mode, enable, in that order,
++ * one write at a time. The resources are spelled with the PMIC's letter ("ldoa26" is the
++ * PM8998's LDO 26); "ldo26" is asked for too, as the touch screen's driver does.
++ */
++static bool
++rpmh_regulator(const char *name, uint32_t mv, const char *label)
++{
++	uint32_t base = rpmh_address(name);
++
++	if (base == 0) {
++		char short_name[8] = { 0 };
++
++		if (name[0] == 'l' && name[1] == 'd' && name[2] == 'o' && name[3] == 'a' && strlen(name) < 7) {
++			strlcpy(short_name, "ldo", sizeof(short_name));
++			strlcat(short_name, name + 4, sizeof(short_name));
++			base = rpmh_address(short_name);
++		}
++		if (base == 0) {
++			say("pcie: RPMh: no regulator \"%s\" for %s\n", name, label);
++			return false;
++		}
++	}
++	if ((base >> 16 & 0xf) != 4) {
++		say("pcie: RPMh: \"%s\" is not a regulator (address %#x): %s NOT touched\n", name, base, label);
++		return false;
++	}
++	say("pcie: RPMh: %s is \"%s\" at %#x, asked for %u uV\n", label, name, base, mv);
++	if (!rpmh_write(base + VRM_VOLTAGE, mv, label)) {
++		return false;
++	}
++	if (!rpmh_write(base + VRM_MODE, VRM_MODE_LDO_HPM, label)) {
++		return false;
++	}
++	if (!rpmh_write(base + VRM_ENABLE, 1, label)) {
++		return false;
++	}
++	say("pcie: the %s supply is on (%s, %u uV, HPM)\n", label, name, mv);
++	return true;
++}
++
++/* ---- the QMP v3 lane's tables (the mainline sdm845 ones, which the phone's own device
++ * tree writes out value for value) ---------------------------------------------------------------------- */
++
++struct qmp_table {
++	uint16_t offset;
++	uint8_t value;
++};
++
++static const struct qmp_table serdes_tbl[] = {
++	{ 0x034, 0x14 }, { 0x138, 0x30 }, { 0x048, 0x07 }, { 0x15c, 0x06 }, { 0x090, 0x01 }, { 0x088, 0x20 },
++	{ 0x0f0, 0x00 }, { 0x0f8, 0x01 }, { 0x0f4, 0xc9 }, { 0x11c, 0xff }, { 0x120, 0x3f }, { 0x164, 0x01 },
++	{ 0x154, 0x00 }, { 0x148, 0x0a }, { 0x05c, 0x19 }, { 0x038, 0x90 }, { 0x0b0, 0x82 }, { 0x0c0, 0x02 },
++	{ 0x0bc, 0xea }, { 0x0b8, 0xab }, { 0x0a0, 0x00 }, { 0x09c, 0x0d }, { 0x098, 0x04 }, { 0x13c, 0x00 },
++	{ 0x060, 0x06 }, { 0x068, 0x16 }, { 0x070, 0x36 }, { 0x184, 0x01 }, { 0x138, 0x33 }, { 0x03c, 0x02 },
++	{ 0x040, 0x06 }, { 0x080, 0x04 }, { 0x0dc, 0x00 }, { 0x0d8, 0x3f }, { 0x00c, 0x09 }, { 0x010, 0x01 },
++	{ 0x01c, 0x40 }, { 0x020, 0x01 }, { 0x014, 0x02 }, { 0x018, 0x00 }, { 0x024, 0x7e }, { 0x028, 0x15 },
++};
++
++static const struct qmp_table tx_tbl[] = {
++	{ 0x044, 0x02 }, { 0x0a4, 0x12 }, { 0x060, 0x10 }, { 0x08c, 0x06 },
++};
++
++static const struct qmp_table rx_tbl[] = {
++	{ 0x104, 0x03 }, { 0x100, 0x10 }, { 0x10c, 0x14 }, { 0x0d4, 0x0e }, { 0x0d8, 0x04 }, { 0x0dc, 0x1a },
++	{ 0x034, 0x4b }, { 0x014, 0x04 }, { 0x00c, 0x04 }, { 0x0f8, 0x71 }, { 0x164, 0x59 }, { 0x168, 0x59 },
++	{ 0x0fc, 0x80 }, { 0x11c, 0x40 }, { 0x044, 0x71 }, { 0x03c, 0x40 },
++};
++
++static const struct qmp_table pcs_tbl[] = {
++	{ 0x0c8, 0x83 }, { 0x0cc, 0x09 }, { 0x0d0, 0xa2 }, { 0x0d4, 0x40 }, { 0x0c4, 0x02 }, { 0x1ac, 0x00 },
++	{ 0x0a0, 0x01 }, { 0x1e0, 0x00 }, { 0x1dc, 0x20 }, { 0x1a8, 0x00 }, { 0x0a4, 0x01 }, { 0x0a8, 0x73 },
++	{ 0x1d8, 0xbb }, { 0x1b0, 0x03 }, { 0x20c, 0x0d }, { 0x06c, 0x00 },
++};
++
++static const struct qmp_table pcs_misc_tbl[] = {
++	{ 0x054, 0x04 }, { 0x02c, 0x52 }, { 0x044, 0x00 },
++};
++
++static void
++qmp_write(vm_offset_t base, const struct qmp_table *table, unsigned count)
++{
++	for (unsigned i = 0; i < count; i++) {
++		wr(base + table[i].offset, table[i].value);
++	}
++}
++
++/* ---- the SMMU's BDF-to-sid table ---------------------------------------------------------------------- */
++
++/* the table entry's hash: a CRC8 over the BDF's two bytes, most significant bit first */
++static uint8_t
++bdf_crc8(uint32_t bdf)
++{
++	uint8_t crc = 0;
++
++	for (int byte = 1; byte >= 0; byte--) {
++		crc ^= (bdf >> (8 * byte)) & 0xff;
++		for (int bit = 0; bit < 8; bit++) {
++			crc = (crc & 0x80) ? (uint8_t)(crc << 1 ^ 0x07) : (uint8_t)(crc << 1);
++		}
++	}
++	return crc;
++}
++
++/*
++ * The device tree maps every bus's device 0 to a sid ("iommu-map" of 16 entries: sid 0x1c10
++ * + bus). The translation table answers with the sid of the traffic's BDF; the table is
++ * chained where two BDFs hash to one slot, the way the mainline driver chains them.
++ */
++static void
++sid_table_program(void)
++{
++	static const uint32_t base_sid = 0x1c10;
++
++	for (unsigned i = 0; i < 256; i++) {
++		wr(PARF(PARF_BDF_TO_SID_TABLE + 4 * i), 0);
++	}
++	for (unsigned bus = 0; bus < 16; bus++) {
++		uint32_t bdf = bus << 8;
++		uint32_t hash = bdf_crc8(bdf);
++		uint32_t back, val = bdf << 16 | bus << 8;      /* the sid offset from the map's base */
++		while ((back = rd(PARF(PARF_BDF_TO_SID_TABLE + 4 * hash))) != 0) {
++			if (!(back & 0xff)) {
++				back |= (hash + 1) % 256;
++				wr(PARF(PARF_BDF_TO_SID_TABLE + 4 * hash), back);
++			}
++			hash = (hash + 1) % 256;
++		}
++		wr(PARF(PARF_BDF_TO_SID_TABLE + 4 * hash), val);
++		say("pcie: sid table: bdf %#x -> sid %#x (slot %u)\n", bdf, base_sid + bus, hash);
++	}
++}
++
++/* ---- the link ----------------------------------------------------------------------------------------- */
++
++/* the controller's own PCIe capability, for the link's status */
++static uint32_t
++pcie_cap(void)
++{
++	uint32_t pointer = rd(DBI(0x34)) & 0xff;
++
++	for (unsigned hops = 0; pointer != 0 && hops < 16; hops++) {
++		uint32_t cap = rd(DBI(pointer));
++
++		if ((cap & 0xff) == 0x10) {
++			return pointer;
++		}
++		pointer = (cap >> 8) & 0xff;
++	}
++	return 0;
++}
++
++static void
++show_link(const char *when)
++{
++	uint32_t cap = pcie_cap(), lnksta = 0;
++
++	if (cap != 0) {
++		lnksta = rd(DBI(cap + 0x10)) >> 16;
++	}
++	say("pcie: %s: LNKSTA %#04x (speed %u, width %u), DLLLA %u, LTSSM state %u\n", when, lnksta,
++	    lnksta & 0xf, (lnksta >> 4) & 0x1f, !!(lnksta & 1u << 16), rd(PARF(PARF_LTSSM_STATE)) & 0x3f);
++}
++
++/* ---- the steps ---------------------------------------------------------------------------------------- */
++
++/* one register, named before and after the read: a trapped read must leave the log saying
++ * WHICH register was its last (the touch screen's driver's lesson, for reads -- the runs
++ * of Oct 26: the first survey printed nothing, because every read happened before any line
++ * could go out, and the phone went to EDL with the killer anonymous) */
++static uint32_t
++probe(vm_offset_t address, const char *name)
++{
++	uint32_t value;
++
++	say("pcie: read %s at %lx\n", name, address);
++	value = rd(address);
++	say("pcie: read %s = %#x\n", name, value);
++	return value;
++}
++
++/* the six blocks, one step each, read only */
++static void
++probe_tlmm(void)
++{
++	probe(GPIO_CFG(PIN_PERST), "gpio35 cfg");
++	probe(GPIO_IO(PIN_PERST), "gpio35 io");
++	probe(GPIO_CFG(PIN_WAKE), "gpio37 cfg");
++	probe(GPIO_IO(PIN_WAKE), "gpio37 io");
++}
++
++static void
++probe_dbi(void)
++{
++	probe(DBI(0x00), "dbi vendor/device");
++	probe(DBI(0x08), "dbi class");
++	probe(DBI(0x34), "dbi cap pointer");
++	uint32_t cap = pcie_cap();
++
++	if (cap != 0) {
++		probe(DBI(cap + 0xc), "dbi LNKCAP");
++		probe(DBI(cap + 0x10), "dbi LNKCTL/STA");
++	}
++}
++
++static void
++probe_conf(void)
++{
++	probe(CONF(0, 0), "conf (0,0,0) id");
++	probe(CONF(0, 4), "conf (0,0,0) command");
++	probe(CONF(0, 8), "conf (0,0,0) class");
++}
++
++static void
++probe_phy(void)
++{
++	probe(PCS(PCS_SW_RESET), "pcs SW_RESET");
++	probe(PCS(PCS_POWER_DOWN_CONTROL), "pcs POWER_DOWN");
++	probe(PCS(PCS_START_CONTROL), "pcs START");
++	probe(PCS(PCS_STATUS), "pcs STATUS");
++}
++
++static void
++probe_gcc(void)
++{
++	probe(GCC(GCC_PCIE_0_BCR), "gcc BCR");
++	probe(GCC(GCC_PCIE_0_GDSCR), "gcc GDSCR");
++	probe(GCC(GCC_PCIE_0_GDSCR + 4), "gcc GDSC cfg");
++	probe(GCC(GCC_PCIE_0_CLK_VOTE), "gcc votes");
++	probe(GCC(GCC_PCIE_0_Q2A_HALT), "gcc q2a halt");
++	probe(GCC(GCC_PCIE_0_SLV_HALT), "gcc slv halt");
++	probe(GCC(GCC_PCIE_0_MSTR_HALT), "gcc mstr halt");
++	probe(GCC(GCC_PCIE_0_CFG_HALT), "gcc cfg halt");
++	probe(GCC(GCC_PCIE_0_AUX_HALT), "gcc aux halt");
++	probe(GCC(GCC_PCIE_0_AUX_CLK_CMD), "gcc aux RCG cmd");
++	probe(GCC(GCC_PCIE_0_AUX_CLK_CFG), "gcc aux RCG cfg");
++	probe(GCC(GCC_PCIE_PHY_REFGEN_CMD), "gcc refgen RCG cmd");
++	probe(GCC(GCC_PCIE_PHY_REFGEN_CFG), "gcc refgen RCG cfg");
++	probe(GCC(GCC_PCIE_0_CLKREF_EN), "gcc clkref");
++	probe(GCC(GCC_PCIE_PHY_AUX_HALT), "gcc phy aux");
++	probe(GCC(GCC_PCIE_PHY_REFGEN_HALT), "gcc phy refgen");
++}
++
++static void
++probe_parf(void)
++{
++	probe(PARF(PARF_SYS_CTRL), "parf SYS_CTRL");
++	probe(PARF(PARF_PM_CTRL), "parf PM_CTRL");
++	probe(PARF(PARF_PHY_CTRL), "parf PHY_CTRL");
++	probe(PARF(PARF_MHI_CLOCK_RESET), "parf MHI_CRS");
++	probe(PARF(PARF_LTSSM_STATE), "parf LTSSM");
++	probe(PARF(PARF_DEVICE_TYPE), "parf DEVICE_TYPE");
++	probe(PARF(PARF_DBI_BASE_V2), "parf DBI_BASE");
++	probe(PARF(PARF_SLV_SPACE_V2), "parf SLV_SPACE");
++	probe(PARF(PARF_BDF_TO_SID_CFG), "parf BDF_TO_SID_CFG");
++	probe(PARF(PARF_AXI_MSTR_WR_HALT), "parf AXI_HALT");
++}
++
++static void
++perst_pin(bool high)
++{
++	wr(GPIO_IO(PIN_PERST), high ? 2 : 0);
++	wr(GPIO_CFG(PIN_PERST), CFG_OUTPUT);
++}
++
++static void
++pcie_thread(__unused void *parameter, __unused wait_result_t result)
++{
++	/* the OnePlus 6 only: told apart by its framebuffer, as every phone's driver here does */
++	gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
++	parf = ml_io_map(PARF_PHYS, PARF_SIZE);
++	dbi = ml_io_map(DM_CORE_PHYS, DM_CORE_SIZE);
++	conf = ml_io_map(CONF_PHYS, CONF_SIZE);
++	phy = ml_io_map(PHY_PHYS, PHY_SIZE);
++	tlmm_south = ml_io_map(TLMM_SOUTH_PHYS, TLMM_SOUTH_SIZE);
++	say("pcie: gcc %#lx at %#lx, parf %#lx at %#lx, dbi %#lx at %#lx, conf %#lx at %#lx, phy %#lx at %#lx, tlmm south at %#lx\n",
++	    GCC_PHYS, gcc, PARF_PHYS, parf, DM_CORE_PHYS, dbi, CONF_PHYS, conf, PHY_PHYS, phy, tlmm_south);
++	say("pcie: level %u: %s\n", level, level == 1 ? "the bring-up, to the radio enumerated" : "as far as it goes");
++	if (!step("mapped")) {
++		goto out;
++	}
++	/* the run of Oct 26 16:51 died to EDL while the first survey read (nothing printed,
++	 * every read sat in a say()'s arguments); the runs after name every register before
++	 * its read. The order matters as much as the naming: parf, dbi, conf and the PHY are
++	 * read only AFTER the domain is powered and clocked (reading an unclocked block can
++	 * hang the bus -- the power comes first, the way the mainline and vendor drivers do
++	 * it); the GCC block, which has no gate of its own, is probed first, and shows the
++	 * domain as it was found. The TLMM comes first of all: it is known safe ground. */
++	if (step("probe tlmm")) {
++		probe_tlmm();
++	}
++
++	/* the device held in reset through the whole bring-up (the mainline driver's order: it
++	 * drives the line high from its very first step) */
++	if (step("perst")) {
++		perst_pin(true);
++		say("pcie: gpio%u now drives high (the device held in reset)\n", PIN_PERST);
++	}
++
++	if (step("probe gcc")) {
++		probe_gcc();
++	}
++
++	/* the device tree's vdd-3.3 config words (0x2f5d00, 0x328980) are the VRM's units: MICRO
++	 * volts (Oct 27: the first draft sent millivolts, 1000x low -- never run, the survey was
++	 * where that run died) */
++	if (step("supplies")) {
++		if (!rpmh_regulator("ldoa26", 1200000, "1.2 V")) {
++			say("pcie: the 1.2 V supply did not come up: stopped\n");
++			goto out;
++		}
++		if (!rpmh_regulator("ldoa1", 880000, "0.88 V")) {
++			say("pcie: the 0.88 V supply did not come up: stopped\n");
++			goto out;
++		}
++		wait_ms(10);
++	}
++
++	if (step("clocks")) {
++		uint32_t votes = rd(GCC(GCC_PCIE_0_CLK_VOTE));
++
++		/* the two RCGs first: the gates' parents before the gates (aux from the tcxo,
++		 * refgen from gpll0 at a sixth) */
++		wr(GCC(GCC_PCIE_0_AUX_CLK_CFG), AUX_CFG_TCXO_19_2MHZ);
++		wr(GCC(GCC_PCIE_0_AUX_CLK_CMD), GCC_RCG_UPDATE);
++		if (!poll32(GCC(GCC_PCIE_0_AUX_CLK_CMD), GCC_RCG_UPDATE, 0, 20, "the aux RCG's update")) {
++			goto out;
++		}
++		wr(GCC(GCC_PCIE_PHY_REFGEN_CFG), REFGEN_CFG_GPLL0_100MHZ);
++		wr(GCC(GCC_PCIE_PHY_REFGEN_CMD), GCC_RCG_UPDATE);
++		if (!poll32(GCC(GCC_PCIE_PHY_REFGEN_CMD), GCC_RCG_UPDATE, 0, 20, "the refgen RCG's update")) {
++			goto out;
++		}
++		/* the GDSC: collapse cleared, then "power on complete" waited for */
++		if (rd(GCC(GCC_PCIE_0_GDSCR)) & 1) {
++			wr(GCC(GCC_PCIE_0_GDSCR), rd(GCC(GCC_PCIE_0_GDSCR)) & ~1u);
++			if (!poll32(GCC(GCC_PCIE_0_GDSCR + 4), 1u << 16, 1u << 16, 20, "the GDSC to power up")) {
++				goto out;
++			}
++		}
++		say("pcie: the GDSC is on (gdscr %#x)\n", rd(GCC(GCC_PCIE_0_GDSCR)));
++		/* the six clock votes, then every gate polled to open (bit 31 clear; the pipe's
++		 * gate is skipped in hardware, so it is not polled) */
++		wr(GCC(GCC_PCIE_0_CLK_VOTE), votes | GCC_VOTE_SLV_AXI | GCC_VOTE_MSTR_AXI | GCC_VOTE_CFG_AHB |
++		    GCC_VOTE_AUX | GCC_VOTE_PIPE | GCC_VOTE_SLV_Q2A);
++		say("pcie: votes %#x -> %#x\n", votes, rd(GCC(GCC_PCIE_0_CLK_VOTE)));
++		if (!poll32(GCC(GCC_PCIE_0_Q2A_HALT), 1u << 31, 0, 20, "the q2a AXI clock") ||
++		    !poll32(GCC(GCC_PCIE_0_SLV_HALT), 1u << 31, 0, 20, "the slave AXI clock") ||
++		    !poll32(GCC(GCC_PCIE_0_MSTR_HALT), 1u << 31, 0, 20, "the master AXI clock") ||
++		    !poll32(GCC(GCC_PCIE_0_CFG_HALT), 1u << 31, 0, 20, "the cfg AHB clock") ||
++		    !poll32(GCC(GCC_PCIE_0_AUX_HALT), 1u << 31, 0, 20, "the aux clock")) {
++			goto out;
++		}
++		wr(GCC(GCC_PCIE_0_CLKREF_EN), rd(GCC(GCC_PCIE_0_CLKREF_EN)) | 1);
++		if (!poll32(GCC(GCC_PCIE_0_CLKREF_EN), 1u << 31, 0, 20, "the clkref clock")) {
++			goto out;
++		}
++		/* the PHY's two own supplies of clock */
++		wr(GCC(GCC_PCIE_PHY_AUX_HALT), rd(GCC(GCC_PCIE_PHY_AUX_HALT)) | 1);
++		if (!poll32(GCC(GCC_PCIE_PHY_AUX_HALT), 1u << 31, 0, 20, "the phy aux clock")) {
++			goto out;
++		}
++		wr(GCC(GCC_PCIE_PHY_REFGEN_HALT), rd(GCC(GCC_PCIE_PHY_REFGEN_HALT)) | 1);
++		if (!poll32(GCC(GCC_PCIE_PHY_REFGEN_HALT), 1u << 31, 0, 20, "the phy refgen clock")) {
++			goto out;
++		}
++	}
++
++	if (step("resets")) {
++		wr(GCC(GCC_PCIE_0_BCR), rd(GCC(GCC_PCIE_0_BCR)) | 1);
++		wr(GCC(GCC_PCIE_0_PHY_BCR), rd(GCC(GCC_PCIE_0_PHY_BCR)) | 1);
++		wait_ms(1);
++		wr(GCC(GCC_PCIE_0_BCR), rd(GCC(GCC_PCIE_0_BCR)) & ~1u);
++		wr(GCC(GCC_PCIE_0_PHY_BCR), rd(GCC(GCC_PCIE_0_PHY_BCR)) & ~1u);
++		wait_ms(1);
++		say("pcie: the core and PHY resets released (BCRs %#x %#x)\n", rd(GCC(GCC_PCIE_0_BCR)),
++		    rd(GCC(GCC_PCIE_0_PHY_BCR)));
++	}
++
++	/* the domain is powered and clocked now: the four blocks that must not be read cold,
++	 * probed one step each (the first read of each names the phone's killer if it dies) */
++	if (step("probe parf")) {
++		probe_parf();
++	}
++	if (step("probe dbi")) {
++		probe_dbi();
++	}
++	if (step("probe conf")) {
++		probe_conf();
++	}
++	if (step("probe phy")) {
++		probe_phy();
++	}
++
++	if (step("parf")) {
++		/* the mainline init sequence of the 1.9.0 controller, register by register */
++		wr(PARF(PARF_DEVICE_TYPE), 4);
++		wr(PARF(PARF_PHY_CTRL), rd(PARF(PARF_PHY_CTRL)) & ~PHY_TEST_PWR_DOWN);
++		wr(PARF(PARF_DBI_BASE_V2), DM_CORE_PHYS);
++		wr(PARF(PARF_DBI_BASE_HI_V2), 0);
++		wr(PARF(PARF_SLV_SPACE_V2), 0);
++		wr(PARF(PARF_SLV_SPACE_HI_V2), 0x80000000);
++		wr(PARF(PARF_SYS_CTRL), rd(PARF(PARF_SYS_CTRL)) & ~MAC_PHY_POWERDOWN_IN_P2_D_MUX_EN);
++		wr(PARF(PARF_MHI_CLOCK_RESET), rd(PARF(PARF_MHI_CLOCK_RESET)) | MHI_CLOCK_BYPASS);
++		wr(PARF(PARF_PM_CTRL), rd(PARF(PARF_PM_CTRL)) & ~REQ_NOT_ENTR_L1);
++		wr(PARF(PARF_AXI_MSTR_WR_HALT), rd(PARF(PARF_AXI_MSTR_WR_HALT)) | AXI_MSTR_WR_ADDR_HALT_EN);
++		say("pcie: parf: SYS_CTRL %#x, PM_CTRL %#x, PHY_CTRL %#x, MHI_CRS %#x, AXI_HALT %#x, DEVICE_TYPE %#x\n",
++		    rd(PARF(PARF_SYS_CTRL)), rd(PARF(PARF_PM_CTRL)), rd(PARF(PARF_PHY_CTRL)), rd(PARF(PARF_MHI_CLOCK_RESET)),
++		    rd(PARF(PARF_AXI_MSTR_WR_HALT)), rd(PARF(PARF_DEVICE_TYPE)));
++	}
++
++	if (step("phy")) {
++		/* the QMP v3 lane, in the mainline driver's order: into power down first, the
++		 * tables in, out of reset, started, then "PHYSTATUS" waited to clear */
++		wr(PCS(PCS_POWER_DOWN_CONTROL), rd(PCS(PCS_POWER_DOWN_CONTROL)) | SW_PWRDN | REFCLK_DRV_DSBL);
++		qmp_write(phy, serdes_tbl, sizeof(serdes_tbl) / sizeof(serdes_tbl[0]));
++		qmp_write(TXRX(0), tx_tbl, sizeof(tx_tbl) / sizeof(tx_tbl[0]));
++		qmp_write(TXRX(0) + 0x200, rx_tbl, sizeof(rx_tbl) / sizeof(rx_tbl[0]));
++		qmp_write(PCS(0), pcs_tbl, sizeof(pcs_tbl) / sizeof(pcs_tbl[0]));
++		qmp_write(PCS_MISC(0), pcs_misc_tbl, sizeof(pcs_misc_tbl) / sizeof(pcs_misc_tbl[0]));
++		wr(PCS(PCS_SW_RESET), rd(PCS(PCS_SW_RESET)) & ~SW_RESET_);
++		wr(PCS(PCS_START_CONTROL), rd(PCS(PCS_START_CONTROL)) | SERDES_START | PCS_START_);
++		wait_ms(1);
++		if (!poll32(PCS(PCS_STATUS), PHYSTATUS, 0, 20, "the PHY to be ready")) {
++			show("phy", PCS(PCS_STATUS));
++			goto out;
++		}
++		say("pcie: the PHY is ready (STATUS %#x, SW_RESET %#x)\n", rd(PCS(PCS_STATUS)), rd(PCS(PCS_SW_RESET)));
++	}
++
++	if (step("perst release")) {
++		wait_ms(100);
++		perst_pin(false);
++		wait_ms(1);
++		say("pcie: gpio%u now drives low (the device out of reset, the link may train)\n", PIN_PERST);
++	}
++
++	if (step("sid")) {
++		wr(PARF(PARF_BDF_TO_SID_CFG), rd(PARF(PARF_BDF_TO_SID_CFG)) & ~1u);
++		sid_table_program();
++		say("pcie: the sid table written, translation on (BDF_TO_SID_CFG %#x)\n", rd(PARF(PARF_BDF_TO_SID_CFG)));
++	}
++
++	if (step("ltssm")) {
++		uint32_t cap = pcie_cap();
++
++		wr(PARF(PARF_LTSSM_STATE), rd(PARF(PARF_LTSSM_STATE)) | LTSSM_ENABLE);
++		show_link("asked to train");
++		bool up = false;
++		for (unsigned i = 0; i < 50; i++) {             /* a second, as the mainline driver waits */
++			wait_ms(20);
++			uint32_t lnksta = cap != 0 ? rd(DBI(cap + 0x10)) >> 16 : 0;
++
++			if (lnksta & 1u << 16) {
++				up = true;
++				break;
++			}
++			if (i % 5 == 0) {
++				show_link("training");
++			}
++		}
++		show_link(up ? "LINK UP" : "link NOT up");
++		if (!up) {
++			say("pcie: the link did not come up: stopped before the enumeration\n");
++			goto out;
++		}
++	}
++
++	if (step("enumerate")) {
++		uint32_t id = rd(CONF(0, 0)), class = rd(CONF(0, 8));
++		bool found = (id & 0xffff) == 0x17cb && (id >> 16) == 0x1101;
++
++		say("pcie: (0,0,0): vendor %#06x device %#06x class %#08x %s\n", id & 0xffff, id >> 16, class,
++		    found ? "-- THE RADIO" : id == 0xffffffff ? "(nothing answers)" : "(not the radio)");
++		for (unsigned i = 0; i < 16; i++) {
++			say("pcie: conf %02x: %08x %08x %08x %08x\n", i * 16, rd(CONF(0, i * 16 + 0)), rd(CONF(0, i * 16 + 4)),
++			    rd(CONF(0, i * 16 + 8)), rd(CONF(0, i * 16 + 12)));
++		}
++		if (found) {
++			say("pcie: the WCN3990 is up on bus 0: the radio's config space is at %#lx\n", CONF(0, 0));
++		}
++	}
++out:
++	say("pcie: done\n");
++	thread_terminate(current_thread());
++}
++
++void
++redwood_pcie_init(void)
++{
++	thread_t thread;
++
++	/* the OnePlus 6 only: told apart by its framebuffer, as the buttons are (redwood_buttons.c) */
++	if (PE_state.video.v_baseAddr != 0x9D400000) {
++		return;
++	}
++	if (!PE_parse_boot_argn("pcie", &level, sizeof(level)) || level == 0) {
++		return;
++	}
++	PE_parse_boot_argn("pcie_step", &step_limit, sizeof(step_limit));
++	PE_parse_boot_argn("pcie_slow", &slow, sizeof(slow));   /* 1 = 8 s between the steps */
++	if (kernel_thread_start(pcie_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
+diff --git a/xnu/files/bsd/dev/redwood_wcn3990.c b/xnu/files/bsd/dev/redwood_wcn3990.c
+new file mode 100644
+index 0000000..6c3fbc2
+--- /dev/null
++++ b/xnu/files/bsd/dev/redwood_wcn3990.c
+@@ -0,0 +1,2027 @@
++/*
++ * The OnePlus 6's Wi-Fi chip: a Qualcomm WCN3990, and not the way the other phones' radios
++ * are reached. It hangs off the SNOC, the system bus, as its own memory-mapped block
++ * ("qcom,icnss@18800000" in the vendor device tree, "wifi@18800000" and
++ * "qcom,wcn3990-wifi" in the mainline one), NOT on PCIe, and NOT behind any DSP of its
++ * own: the WCN's processor is the radio, the host maps its registers, hands it a megabyte
++ * of shared "MSA" memory, and the WLAN firmware (wlanmdsp.mbn) is brought over through the
++ * QMI WLFW service -- which lives on the MODEM, so the modem has to be running for this
++ * chip to speak (the TrustZone ownership dance says as much: the MSA memory is assigned to
++ * VMID_MSS_MSA, the modem's own identity).
++ *
++ *   membase    0x18800000, 8 MB   the radio's registers, on the SNOC
++ *   iommu      apps SMMU, stream id 0x40 (the vendor tree adds "smmu-s1-bypass", meaning
++ *              its stage-1 is left off and the radio's DMA addresses go to stage-2; the
++ *              vendor's stage-2 window for it starts at 0xa0000000)
++ *   msa        1 MB of shared memory ("qcom,wlan-msa-memory")
++ *   supplies   four PM8998 rails, by RPMh vote: ldoa5 0.8 V (cx/mx), ldoa7 1.8 V (xo),
++ *              ldoa17 1.3 V (rfa), ldoa25 3.3 V (ch0; the vendor tree's range for it is
++ *              3.10-3.312 V)
++ *   clock      RPMh's RF_CLK2 ("rfclkd2" in the command database; the mainline tree names
++ *              it "cxo_ref_clk_pin"), the radio's reference
++ *   interrupts GIC SPI 414..424, level high, one per copy engine -- not wired in this
++ *              bring-up; the runs are read-only
++ *
++ * What THIS driver does (boot-arg wcn=1) is only the first act, and deliberately so: the
++ * runs of Oct 26 (the PCIe work, since archived) taught the hard way that the first read
++ * of a cold block can take the machine down. So:
++ *
++ *   1  mapped     the blocks mapped (no reads)
++ *   2  supplies   the four rails voted on, one RPMh write at a time (the RPMh plumbing is
++ *                 the touch screen's and the archived PCIe driver's; the VRM's voltage
++ *                 register counts MICRO volts -- the device tree's 0x2f5d00 says 3,100,000)
++ *   3  rfclk      the reference clock voted on (one word, 1 = on, as the mainline
++ *                 clk-rpmh sends it)
++ *   4  probe      the membase read at eight spread offsets, every register named before
++ *                 its read and its value said after -- powered now, so a cold hang is not
++ *                 the risk it was; the values as found are the run's evidence
++ *   5  smmu       the apps SMMU looked at, read only: what stream match, if any, serves
++ *                 sid 0x40 today (the loader jumped in from Android, which ran the radio
++ *                 -- whatever the hypervisor left configured is worth knowing before any
++ *                 of it is changed), and that context's registers as found
++ *   6  modem      the modem (MPSS) booted through its PIL, the way the OnePlus 6's own
++ *                 msm-4.9 kernel does it (drivers/soc/qcom/pil-msa.c, self-auth): the
++ *                 cx/mx/mss levels voted TURBO, the seven MSS clocks of the GCC turned
++ *                 on, the modem held in reset and released (restart/pdc-sync/alt-reset),
++ *                 the MBA's image named to the RMB, the Q6's boot FSM started; the PBL
++ *                 and the MBA report through the RMB registers, the metadata (the mdt's
++ *                 headers and hashes) is authenticated first, then the image's segments
++ *                 are copied to their real addresses while the MBA hashes them, until
++ *                 it reports AUTH_COMPLETE. No ownership transfer: the OnePlus 6's
++ *                 kernel does none either (the desc's subsys_vmid is 0), the memory is
++ *                 written as it is
++ *   7  probe      the membase probed again -- the firmware now owns the block, the
++ *                 reads are safe -- and the shared memory scanned for SMP2P entries:
++ *                 the modem talks through "mpss-*" edges, and their presence is the
++ *                 proof the whole bring-up waits for
++ *
++ * Every step prints what it does and what it read, and stops the bring-up when what it
++ * read is not what it expected. The firmware, the QMI conversation and the interrupts are
++ * the NEXT act (they need this evidence first).
++ *
++ * Boot-args:  wcn=1  run it;  wcn_step=N  stop after step N;  wcn_slow=1  8 s between the
++ * steps (runs die faster than the host reads the log; the gaps let every line through).
++ */
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <mach/vm_param.h>
++#include <pexpert/pexpert.h>
++#include <sys/redwood_input.h>
++#include <sys/systm.h>
++#include <vm/memory_types.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
++extern boolean_t ml_get_interrupts_enabled(void);
++extern kern_return_t thread_terminate(thread_t thread);
++extern void loader_log_putc(char c);
++extern const uint8_t *redwood_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
++
++static uint32_t level;
++static unsigned step_number, step_limit, slow;
++
++static int say(const char *format, ...) __printflike(1, 2);
++
++static int
++say(const char *format, ...)
++{
++	char line[300];
++	va_list list;
++	int length;
++
++	va_start(list, format);
++	length = vsnprintf(line, sizeof(line), format, list);
++	va_end(list);
++	for (const char *c = line; *c != 0; c++) {
++		loader_log_putc(*c);
++	}
++	if (ml_get_interrupts_enabled()) {
++		printf("%s", line);
++	}
++	return length;
++}
++
++static inline uint32_t
++rd(vm_offset_t address)
++{
++	return *(volatile uint32_t *)address;
++}
++
++static inline void
++wr(vm_offset_t address, uint32_t value)
++{
++	*(volatile uint32_t *)address = value;
++}
++
++static void
++spin_us(uint32_t us)
++{
++	uint64_t until;
++
++	nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &until);
++	until += mach_absolute_time();
++	while (mach_absolute_time() < until) {
++	}
++}
++
++static uint64_t
++now_us(void)
++{
++	return mach_absolute_time() / 24;       /* the 24 MHz timebase, in microseconds */
++}
++
++static void
++wait_ms(uint32_t ms)
++{
++	if (slow) {
++		spin_us(ms * 1000);
++	} else {
++		delay_for_interval(ms, NSEC_PER_MSEC);
++	}
++}
++
++static bool
++step(const char *what)
++{
++	step_number++;
++	if (step_limit != 0 && step_number > step_limit) {
++		return false;
++	}
++	say("wcn: step %u: %s\n", step_number, what);
++	if (slow) {
++		say("wcn: -- step %s done, sleeping 8 s --\n", what);
++		wait_ms(8000);
++	}
++	return true;
++}
++
++/* one register, named before and after the read (a trapped read must not be anonymous) */
++static uint32_t
++probe(vm_offset_t address, const char *name)
++{
++	uint32_t value;
++
++	say("wcn: read %s at %lx\n", name, address);
++	value = rd(address);
++	say("wcn: read %s = %#x\n", name, value);
++	return value;
++}
++
++/* ---- the blocks ------------------------------------------------------------------------------------- */
++
++#define MEMBASE_PHYS            0x18800000UL    /* the radio's registers (dt reg 0) */
++#define MEMBASE_SIZE            0x800000UL
++#define MEM(off)                (membase + (off))
++
++#define SMMU_PHYS               0x15000000UL    /* the apps SMMU (as redwood_wifi.c has it) */
++#define SMMU_SIZE               0x100000UL      /* the DT's reg size: the context banks live at 0x8000+0x1000*n
++                                                 * and a 0x2000 map sent the run101 read 30 KB past its end (EDL) */
++#define SMMU(reg)               (smmu + (reg))
++#define SMMU_SMR(n)             (0x800 + 4 * (n))       /* bit 31 valid, [30:16] mask, [14:0] stream */
++#define SMMU_S2CR(n)            (0xc00 + 4 * (n))       /* [17:16] 0 translate 1 bypass 2 fault, [7:0] context */
++#define SMMU_IDR0               0x020           /* [7:0] stream match registers */
++#define SMMU_IDR1               0x024           /* [7:0] translation contexts */
++#define SMMU_CB_SCTLR(n)        (0x8000 + 0x1000 * (n)) /* the context bank's own page (MMU-500 layout) */
++#define SMMU_CB_TTBR0(n)        (SMMU_CB_SCTLR(n) + 0x20)
++#define SMMU_CBAR(n)            (0x0 + 4 * (n))         /* second page (+0x1000): a word per context */
++#define SMMU_SECOND_BASE        0x1000
++
++#define SMEM_PHYS               0x80900000UL    /* the shared memory (as redwood_wifi.c has it) */
++#define SMEM_SIZE               0x200000UL
++#define SMEM_VERSION_WORD       0x5c            /* the boot loader's word, [31:16] its version */
++#define SMP2P_MAGIC             0x504d5324      /* "$smp2p" */
++#define SMP2P_COUNTS            0x18            /* u32: valid entries in [31:16] */
++#define SMP2P_FLAGS             0x1c
++#define SMP2P_NAME(i)           (0x20 + 20 * (i))       /* 16 bytes of name, then a u32 value */
++#define SMP2P_ENTRY_VALUE(i)    (SMP2P_NAME(i) + 16)
++#define SMP2P_RESTART_DONE      (1u << 0)
++#define SMP2P_RESTART_ACK       (1u << 1)
++
++#define RADIO_SID               0x40            /* the device tree's iommus: <apps_smmu 0x40 1> */
++
++/* ---- the modem (MPSS), the way the OnePlus 6's own kernel boots it --------------------
++ * (drivers/soc/qcom/pil-msa.c of the msm-4.9 tree, "qcom,pil-q6v55-mss" + "qcom,pil-self-auth"):
++ * the Q6's PBL fetches the MBA from the RMB-named image, the MBA takes the metadata and
++ * the segments from the places the RMB names, and every step of it is acknowledged in
++ * RMB_MBA_STATUS. The vendor tree's mss node carries: qdsp6 0x04080000, rmb 0x04180000,
++ * restart_reg 0x0c2b0000, pdc_sync 0x0b2e0100 (the modem's bit is BIT(8), qcom,mss_pdc_offset),
++ * alt_reset 0x04180044; and its clocks are the seven MSS branches of the GCC at 0x100000. */
++
++#define QDSP6_PHYS              0x04080000UL    /* the QDSP6SS registers */
++#define QDSP6_SIZE              0x1000UL
++#define QDSP6(reg)              (qdsp6 + (reg))
++#define QDSP6SS_SLEEP           0x3c            /* bit 0 = keep the sleep clock on; bit 31 CLKOFF */
++#define QDSP6SS_DBG_CFG         0x018           /* the vendor saves/restores it around the reset
++                                                 * cycle; its read is our canary (the vendor's
++                                                 * first touch of the modem's own space too) */
++#define QDSP6SS_BOOT_CORE_START 0x400
++#define QDSP6SS_BOOT_CMD        0x404
++
++#define RMB_PHYS                0x04180000UL    /* the RMB: the MBA's mailbox */
++#define RMB_SIZE                0x100UL
++#define RMB(reg)                (rmb + (reg))
++#define RMB_MBA_IMAGE           0x00            /* where the MBA image is */
++#define RMB_PBL_STATUS          0x04            /* the Q6's PBL reports here (1 = success) */
++#define RMB_MBA_COMMAND         0x08            /* 1 = metadata ready, 2 = load ready */
++#define RMB_MBA_STATUS          0x0c            /* the MBA reports here (1/2 unlocked, 3 metadata, 4 done) */
++#define RMB_PMI_META_DATA       0x10            /* where the metadata is */
++#define RMB_PMI_CODE_START      0x14            /* where the image starts */
++#define RMB_PMI_CODE_LENGTH     0x18            /* how much of it has been handed over */
++#define RMB_MSS_STATUS          0x40            /* bit 0 = the boot FSM finished */
++#define RMB_ALT_RESET           0x44            /* the alt reset line (the vendor tree's "alt_reset") */
++
++#define MSS_RESTART_PHYS        0x0c2b0000UL    /* 1 = the modem held in reset (TCSR) */
++#define MSS_PDC_SYNC_PHYS       0x0b2e0100UL    /* the PDC's copy of it; the modem's bit is
++                                                 * BIT(9) -- the OP6 DT says mss_pdc_offset=<0x09>
++                                                 * and the vendor's pil_mss_pdc_sync does
++                                                 * BIT(offset). BIT(8) was our invention (it may
++                                                 * belong to another subsystem entirely) */
++#define MSS_PDC_MASK            (1u << 9)
++
++#define GCC_PHYS                0x100000UL      /* the Global Clock Controller */
++#define GCC_SIZE                0x180000UL
++#define GCC(off)                (gcc + (off))
++
++/* the AOP's QMP mailbox (qcom,qmp-aop@c300000, "qcom,qmp-mbox"): the msgram carries a
++ * descriptor (magic "MAIL", each side's link/channel state words and its mailbox's
++ * offset/size) at 0, and the doorbell to ring the AOP is its own register at
++ * 0x1799000c (the DT's irq-reg-base, one bit). Protocol from drivers/mailbox/msm_qmp.c
++ * (the lineage-16.0 file), cross-checked against mainline qcom_aoss.c: UP=0x0000ffff,
++ * DOWN=0xffff0000, no sequence numbers -- a message is a u32 length followed by
++ * 4-byte-aligned data in the AP's mailbox, and the AOP's ack is the length word
++ * cleared back to zero (it re-rings the doorbell on the way, SPI 389, which we
++ * ignore: the poll on the length word is the whole handshake) */
++#define QMP_PHYS                0x0c300000UL
++#define QMP_SIZE                0x100000UL
++#define QMP_DOORBELL_PHYS       0x1799000cUL
++#define QMP_MAGIC               0x4d41494c      /* "MAIL", little-endian */
++#define QMP_UP                  0x0000ffffu
++#define QMP_DOWN                0xffff0000u
++#define QMP_UCORE_LINK_STATE    0x0c            /* the AOP's side of the descriptor */
++#define QMP_UCORE_LINK_ACK      0x10
++#define QMP_UCORE_CH_STATE      0x14
++#define QMP_UCORE_CH_ACK        0x18
++#define QMP_MCORE_LINK_STATE    0x24            /* our side */
++#define QMP_MCORE_LINK_ACK      0x28
++#define QMP_MCORE_CH_STATE      0x2c
++#define QMP_MCORE_CH_ACK        0x30
++#define QMP_MCORE_MBOX_SIZE     0x34            /* prefilled by the AOP */
++#define QMP_MCORE_MBOX_OFFSET   0x38
++#define QMP_MSG_LEN             64              /* mainline's QMP_MSG_LEN: m16 sent the
++                                                 * vendor's 96 and the AOP never touched
++                                                 * the length word -- if its RX window
++                                                 * is 64 bytes, a 96 length word is an
++                                                 * invalid size and the message is
++                                                 * dropped silently, which is exactly
++                                                 * what m16 saw */
++
++/* the MSS's clocks, the OP6 vendor tree's own order and names (the qcom,pil-q6v55-mss
++ * node: proxy-clock-names "xo","prng_clk" -- xo is bi_tcxo and never off, so prng leads;
++ * active-clock-names "iface_clk","bus_clk","mem_clk","gpll0_mss_clk","snoc_axi_clk",
++ * "mnoc_axi_clk"). Two kinds of gate:
++ *
++ *   KIND_CBCR: the enable is BIT0 of the CBCR itself -- m10 proved cfg_ahb/q6_memnoc/
++ *     snoc/mfab safe this way.
++ *   KIND_VOTE: the enable is ONE BIT of the GCC branch-vote register 0x52004, and the
++ *     0x34004/0x38004 words are READ-ONLY halt-status registers. This one line is the
++ *     whole t2c/t3/m7b/m8/m9 murder story: we wrote the status words (boot_rom at
++ *     0x38000 -- not even the status address -- and prng at 0x34004, the t3 frame,
++ *     EDL #18, then again in m7b/m8/m9, EDL #22-24) and the machine died at the write,
++ *     the 0.5 s snapshot gap dressing it up as an async death in the preceding sleep.
++ *     The vendor never writes those words: its clock driver ORs ONE bit into 0x52004
++ *     (boot_rom BIT(10) -- the DT's "mem_clk", index 11 -- and prng BIT(13)) and READS
++ *     the status. run108's death (a raw value written to "0x52004 = gpll0 L_VAL") was
++ *     the same register: the vote register holds every voted branch, and the raw write
++ *     cleared them all; the FABIA L_VAL is NOT at block+4, that slot is the vote reg.
++ *     A strict single-bit OR is what the mainline driver does on every enable.
++ *     gpll0_mss (BIT(17), the DT's "gpll0_mss_clk", index 45) has no status word at
++ *     all (BRANCH_HALT_DELAY): the code just delays -- there is NO RCG at 0x52044
++ *     (m10's writes there did nothing, CMD read back 0), that idea is retired. */
++#define KIND_CBCR               0
++#define KIND_VOTE               1
++static const struct { const char *name; uint8_t kind; uint32_t reg, bit, stat; } mss_clocks[] = {
++	{ "prng_ahb (proxy)",   KIND_VOTE, 0x52004, 13, 0x34004 },
++	{ "cfg_ahb (iface)",    KIND_CBCR, 0x8a000,  0, 0x8a000 },
++	{ "q6_memnoc (bus)",    KIND_CBCR, 0x8a154,  0, 0x8a154 },
++	{ "boot_rom (mem)",     KIND_VOTE, 0x52004, 10, 0x38004 },
++	{ "gpll0_mss",          KIND_VOTE, 0x52004, 17, 0 },
++	{ "snoc_axi",           KIND_CBCR, 0x8a150,  0, 0x8a150 },
++	{ "mfab_axis (mnoc)",   KIND_CBCR, 0x8a004,  0, 0x8a004 },
++};
++
++/* the memory the image lands in (the vendor tree's carveouts; written directly -- the
++ * OnePlus 6's own kernel transfers no ownership: its desc->subsys_vmid is 0) */
++#define MBA_PHYS                0x96500000UL    /* the MBA image, 2 MB */
++#define MBA_SIZE                0x200000UL
++#define MPSS_PHYS               0x8e000000UL    /* the mpss region, 120 MB (0x7800000) */
++#define MPSS_SIZE               0x7800000UL
++#define MDATA_PHYS              0xa0000000UL    /* the metadata, 16 KB */
++#define MDATA_SIZE              0x4000UL
++
++#define MBA_CMD_META_DATA_READY 1u
++#define MBA_CMD_LOAD_READY      2u
++#define PBL_STATUS_SUCCESS      1u
++#define MBA_STATUS_XPU_UNLOCKED 1u
++#define MBA_STATUS_SCRIBBLED    2u
++#define MBA_STATUS_META_AUTHED  3u
++#define MBA_STATUS_AUTHED       4u
++
++#define MDT_MAX_SEGMENTS        40
++
++/* the mdt is a 32-bit ELF: e_phoff at 28, e_phnum at 44, entries of 8 words at 0x34 */
++#define MDT_PHNUM(hdr)          (hdr[11] & 0xffff)
++#define MDT_PHOFF(hdr)          (hdr[7])
++#define MDT_MAGIC(hdr)          (hdr[0])
++#define MDT_ELF_MAGIC           0x464c457fu
++struct mdt_phdr {
++	uint32_t type, offset, vaddr, paddr, filesz, memsz, flags, align;
++};
++#define MDT_PT_LOAD             1u
++#define MDT_IS_HASH(flags)      (((flags) >> 24 & 7) == 2)  /* the hash segments, in the mdt */
++
++#define MODEM_POLL_US           10000000        /* 10 s of waiting, 100 us at a time */
++
++static vm_offset_t membase, smmu, smem;
++static vm_offset_t qdsp6, rmb, gcc, mba_map, mpss_map, mdata_map, tcsr_restart, tcsr_pdc;
++static unsigned probe_membase_gate;                     /* wcn_probe_membase=1: probe the membase BEFORE the firmware runs (a cold read hangs the SNOC) */
++static bool modem_up;                                   /* the modem came through its PIL (only then are the membase reads safe) */
++
++/* the eight offsets the membase is probed at: the block's corners and its middle (the
++ * register map is ath10k's to interpret later; these say whether the SNOC answers) */
++static const uint32_t probe_offsets[] = { 0x0, 0x8, 0x400, 0x1000, 0x100000, 0x200000, 0x600000, 0x7ff000 };
++
++/* ---- RPMh (the supplies and the clock) -----------------------------------------------------------------
++ * the OnePlus 6's own TCS driver is drivers/mailbox/qcom-rpmh-mailbox.c (the DTB's
++ * mailbox@179e0000, "qcom,tcs-drv", drv-id 2): the TCS space at 0x179e0d00 holds nine
++ * TCSes of 672 bytes each, and its tcs-config <2 2 0 3 1 3 3 1> makes TCS 0 and 1 the
++ * ACTIVE pair (the SLEEP_TCS/WAKE_TCS/ACTIVE_TCS/CONTROL_TCS values of
++ * dt-bindings/soc/qcom,tcs-mbox.h are 0/1/2/3, and the offsets are handed out in the
++ * order the pairs appear) -- the AMC that a request made while awake goes through is
++ * TCS 0. The register set: per-TCS IRQ_ENABLE 0x00, IRQ_STATUS 0x04, IRQ_CLEAR 0x08,
++ * WAIT_FOR_CMPL 0x10 (a bitmask of send-after-prev, NOT a go bit -- the run91/92
++ * timeouts came from writing 1 into it), CONTROL 0x14 (AMC mode BIT(16), trigger
++ * BIT(24)), STATUS 0x18 (not zero: idle), CMD_ENABLE 0x1c, and the commands at 0x30 +
++ * 20 * n (msgid, address, data, status, response). A write's msgid is 8 | BIT(16)
++ * = 0x10008 (fire-and-forget: no response request -- the run74-75 lesson); a read is
++ * 8 | BIT(8) = 0x108. */
++
++#define RSC_PHYS                0x179e0000UL    /* mailbox@179e0000, the apps_rsc's DRV 2 */
++#define RSC_SIZE                0x10000UL
++#define RSC_TCS(n)              (rsc + 0xd00 + 672 * (n))
++#define RPMH_ACTIVE_TCS         2               /* the DT's tcs-config: TCS 0 and 1 are ACTIVE */
++#define TCS(m, reg)             (RSC_TCS(m) + (reg))
++#define TCS_IRQ_ENABLE          0x00
++#define TCS_IRQ_STATUS          0x04            /* a bit per TCS: completed */
++#define TCS_IRQ_CLEAR           0x08
++#define TCS_WAIT_FOR_CMPL       0x10            /* send-after-prev bitmask: stays 0 */
++#define TCS_CONTROL             0x14
++#define TCS_AMC_MODE_ENABLE     (1u << 16)
++#define TCS_AMC_MODE_TRIGGER    (1u << 24)
++#define TCS_STATUS              0x18            /* not zero: idle */
++#define TCS_CMD_ENABLE          0x1c
++#define TCS_CMD_MSGID(n)        (0x30 + 20 * (n))
++#define TCS_CMD_ADDR(n)         (0x34 + 20 * (n))
++#define TCS_CMD_DATA(n)         (0x38 + 20 * (n))
++#define TCS_CMD_STATUS(n)       (0x3c + 20 * (n))
++#define TCS_CMD_RESP(n)         (0x40 + 20 * (n))
++#define CMD_STATUS_ISSUED       (1u << 8)
++#define CMD_STATUS_COMPL        (1u << 16)
++/* a write goes out WITHOUT the response request (bit 8): this machine's AOP does not
++ * answer response-required writes (the run74-75 lesson -- the OP6's own driver asks
++ * for the response and the OP9's AOP answers, this one does not), so the send is the
++ * completion and the readback verification proves the vote landed */
++#define MSGID_WRITE_4_BYTES     (8u | 1u << 16)
++#define MSGID_READ_4_BYTES      (8u | 1u << 8)
++
++#define VRM_VOLTAGE             0               /* a regulator's registers, from its address: MICRO volts */
++#define VRM_ENABLE              4
++#define VRM_MODE                8
++#define VRM_MODE_LDO_HPM        3
++
++#define CMD_DB_PHYS             0x0c3f000cUL    /* holds the address of the command database */
++#define CMD_DB_SIZE             0x20000UL
++
++struct cmd_db_slave {
++	uint16_t id, header_offset, data_offset, count, version, reserved[3];
++};
++struct cmd_db_header {
++	uint32_t version;
++	uint8_t magic[4];
++	struct cmd_db_slave slave[8];
++	uint32_t checksum, reserved;
++	uint8_t data[];
++};
++struct cmd_db_entry {
++	char id[8];
++	uint32_t priority[2];
++	uint32_t address;
++	uint16_t length, offset;
++};
++
++static vm_offset_t rsc, cmd_db;
++
++/* say every command-database entry whose id contains the fragment (the run100 lesson:
++ * a resource name guessed from a driver of another tree can simply not be there) */
++static void
++cmd_db_dump(const char *fragment)
++{
++	const struct cmd_db_header *db = (const struct cmd_db_header *)cmd_db;
++	size_t flen = strlen(fragment);
++
++	if (db == NULL || db->magic[0] != 0xdb) {
++		return;
++	}
++	for (unsigned s = 0; s < 8; s++) {
++		const struct cmd_db_slave *slave = &db->slave[s];
++		const struct cmd_db_entry *entry = (const struct cmd_db_entry *)(db->data + slave->header_offset);
++
++		/* the walk stays inside the mapped database (the run101 lesson: a garbage slave
++		 * record with a large offset and count reads past the mapping and ends the run) */
++		if (slave->id == 0 || slave->header_offset >= CMD_DB_SIZE - 0x1000 ||
++		    (uint32_t)slave->header_offset + (uint32_t)slave->count * sizeof(struct cmd_db_entry) >
++			CMD_DB_SIZE - 0x1000) {
++			continue;
++		}
++		for (unsigned i = 0; i < slave->count; i++) {
++			char id[9];
++
++			memcpy(id, entry[i].id, 8);
++			id[8] = 0;
++			if (flen == 0 || strnstr(id, fragment, 8) != NULL) {
++				say("wcn: cmd db: slave %u entry %3u: id \"%s\", address %#x, length %u\n", s, i, id,
++				    entry[i].address, entry[i].length);
++			}
++		}
++	}
++}
++
++static uint32_t
++rpmh_address(const char *name)
++{
++	const struct cmd_db_header *db = (const struct cmd_db_header *)cmd_db;
++	char id[8] = { 0 };
++
++	if (db == NULL) {
++		say("wcn: no command database was mapped\n");
++		return 0;
++	}
++	if (db->magic[0] != 0xdb || db->magic[1] != 0x30 || db->magic[2] != 0x03 || db->magic[3] != 0x0c) {
++		say("wcn: no command database (magic %02x %02x %02x %02x)\n", db->magic[0], db->magic[1], db->magic[2],
++		    db->magic[3]);
++		return 0;
++	}
++	strlcpy(id, name, sizeof(id));
++	for (unsigned s = 0; s < 8; s++) {
++		const struct cmd_db_slave *slave = &db->slave[s];
++		const struct cmd_db_entry *entry = (const struct cmd_db_entry *)(db->data + slave->header_offset);
++
++		if (slave->id == 0 || slave->header_offset >= CMD_DB_SIZE - 0x1000 ||
++		    (uint32_t)slave->header_offset + (uint32_t)slave->count * sizeof(struct cmd_db_entry) >
++			CMD_DB_SIZE - 0x1000) {
++			continue;
++		}
++		for (unsigned i = 0; i < slave->count; i++) {
++			if (memcmp(entry[i].id, id, sizeof(id)) == 0) {
++				return entry[i].address;
++			}
++		}
++	}
++	return 0;
++}
++
++/* write, then read back until the register took it (the driver's write_tcs_reg_sync) */
++static void
++wr_sync(vm_offset_t address, uint32_t value)
++{
++	for (int i = 0; i < 1000; i++) {
++		wr(address, value);
++		if (rd(address) == value) {
++			return;
++		}
++		spin_us(1);
++	}
++}
++
++/* ONE request to RPMh through an ACTIVE TCS, exactly the OnePlus 6's own
++ * __tcs_buffer_write: the commands, an empty send-after-prev mask, the command enabled,
++ * the AMC mode re-enabled and triggered -- and the completion polled in the RSC's
++ * IRQ_STATUS (one register, in the first TCS's block, a bit per TCS). The TCS is the
++ * first idle one of the two ACTIVE (the driver's find_free_tcs): one can come back busy
++ * from OUR last run, because the loader does not reset the RSC -- run96's NACK'd voltage
++ * write kept TCS 0 busy across the reboot, and run97 was blocked by its own leftover */
++static bool
++rpmh_transfer(uint32_t address, uint32_t data, bool is_write, const char *what, uint32_t *value_out)
++{
++	int m = -1;             /* the TCS carrying this request */
++	uint32_t done = 0, status = 0;
++	uint64_t began;
++
++	/* the TCS must be idle before it is loaded (the driver's tcs_is_free: status not
++	 * zero); the trigger is left set by the last request, that is its idle mark */
++	for (int t = 0; t < RPMH_ACTIVE_TCS && m < 0; t++) {
++		for (int i = 0; i < 100; i++) {
++			if (rd(RSC_TCS(t) + TCS_STATUS) != 0) {
++				m = t;
++				break;
++			}
++			spin_us(100);
++		}
++	}
++	if (m < 0) {
++		/* every one busy: clear the marks a stuck request leaves (the invalidate, the
++		 * IRQ and the trigger of an unfinished transfer) and look once more */
++		for (int t = 0; t < RPMH_ACTIVE_TCS; t++) {
++			wr(RSC_TCS(t) + TCS_CMD_ENABLE, 0);
++			wr(RSC_TCS(0) + TCS_IRQ_CLEAR, 1u << t);
++			wr_sync(TCS(t, TCS_CONTROL), rd(TCS(t, TCS_CONTROL)) &
++			    ~(TCS_AMC_MODE_TRIGGER | TCS_AMC_MODE_ENABLE));
++		}
++		for (int t = 0; t < RPMH_ACTIVE_TCS && m < 0; t++) {
++			if (rd(RSC_TCS(t) + TCS_STATUS) != 0) {
++				m = t;
++			}
++		}
++	}
++	if (m < 0) {
++		say("wcn: RPMh: no idle TCS (status 0 both): %s not asked\n", what);
++		return false;
++	}
++	if (m != 0) {
++		say("wcn: RPMh: TCS 0 busy (a past run left it so), TCS %u takes the request\n", m);
++	}
++
++	wr(RSC_TCS(0) + TCS_IRQ_CLEAR, 1u << m);
++	wr(TCS(m, TCS_CMD_MSGID(0)), is_write ? MSGID_WRITE_4_BYTES : MSGID_READ_4_BYTES);
++	wr(TCS(m, TCS_CMD_ADDR(0)), address);
++	wr(TCS(m, TCS_CMD_DATA(0)), data);
++	wr(TCS(m, TCS_WAIT_FOR_CMPL), 0);
++	wr(TCS(m, TCS_CMD_ENABLE), rd(TCS(m, TCS_CMD_ENABLE)) | 1u);
++
++	/* HW order: the trigger and then the mode enable are cleared, then the mode enable
++	 * is set, then the trigger (each write verified with a read back) */
++	wr_sync(TCS(m, TCS_CONTROL), rd(TCS(m, TCS_CONTROL)) & ~TCS_AMC_MODE_TRIGGER);
++	wr_sync(TCS(m, TCS_CONTROL), rd(TCS(m, TCS_CONTROL)) & ~TCS_AMC_MODE_ENABLE);
++	wr_sync(TCS(m, TCS_CONTROL), TCS_AMC_MODE_ENABLE);
++	wr(TCS(m, TCS_CONTROL), TCS_AMC_MODE_ENABLE | TCS_AMC_MODE_TRIGGER);
++
++	/* a read waits for the AOP's answer (tens of microseconds when the TCS reports,
++	 * 100 ms at most); a fire-and-forget write only needs its send -- 20 ms to see
++	 * whether the TCS raises its bit, then on. The completion is a CHANGED command
++	 * status with both the ISSUED and the COMPL bit (the IRQ_STATUS bit of a TCS that
++	 * is not the AMC has never been seen to fire: run98), or the IRQ bit itself */
++	uint32_t before = rd(TCS(m, TCS_CMD_STATUS(0)));
++	uint32_t window = is_write ? 20000 : 100000;
++
++	began = now_us();
++	while (now_us() - began < window) {
++		status = rd(TCS(m, TCS_CMD_STATUS(0)));
++		if (status != before &&
++		    (status & (CMD_STATUS_ISSUED | CMD_STATUS_COMPL)) == (CMD_STATUS_ISSUED | CMD_STATUS_COMPL)) {
++			done = 1;
++			break;
++		}
++		if (rd(RSC_TCS(0) + TCS_IRQ_STATUS) & (1u << m)) {
++			done = 1;
++			break;
++		}
++		spin_us(50);
++	}
++	status = rd(TCS(m, TCS_CMD_STATUS(0)));
++	if (is_write) {
++		/* fire-and-forget: the send was the vote; whether the AOP took it, the
++		 * readback verification will say (a voltage outside the resource is NACK'd
++		 * without a word -- the run96 lesson) */
++		say("wcn: RPMh: write %s: sent after %llu us (cmd status %#x -> %#x%s)\n", what, now_us() - began, before,
++		    status, done ? ", the TCS raised its bit" : "");
++		wr(TCS(m, TCS_CMD_ENABLE), 0);
++		wr(RSC_TCS(0) + TCS_IRQ_CLEAR, 1u << m);
++		return true;
++	}
++	uint32_t resp = rd(TCS(m, TCS_CMD_RESP(0)));
++
++	say("wcn: RPMh: read %s: %s after %llu us = %#x (cmd status %#x -> %#x)\n", what, done ? "DONE" : "NOT DONE",
++	    now_us() - began, resp, before, status);
++	if (value_out != NULL) {
++		*value_out = resp;
++	}
++	wr(TCS(m, TCS_CMD_ENABLE), 0);
++	wr(RSC_TCS(0) + TCS_IRQ_CLEAR, 1u << m);
++	return done != 0;
++}
++
++/* a read: what the resource currently reports (a voltage in MICRO volts, a mode, an
++ * enable) -- a legal request (the driver's is_read path, msgid 0x108); run93's wedge
++ * was the wrong RSC base, not the read */
++static bool
++rpmh_read(uint32_t address, uint32_t *out, const char *what)
++{
++	return rpmh_transfer(address, 0, false, what, out);
++}
++
++/* ONE register write to RPMh, waited out (one at a time, as every driver on this phone does) */
++static bool
++rpmh_write(uint32_t address, uint32_t data, const char *what)
++{
++	return rpmh_transfer(address, data, true, what, NULL);
++}
++
++/* A regulator by its name in the command database: voltage (MICRO volts), mode, enable,
++ * one write at a time. The resources are spelled with the PMIC's letter ("ldoa5" is the
++ * PM8998's LDO 5). */
++static bool
++rpmh_regulator(const char *name, uint32_t uv, const char *label)
++{
++	uint32_t base = rpmh_address(name);
++	uint32_t current = 0;
++
++	if (base == 0) {
++		say("wcn: RPMh: no regulator \"%s\" for %s\n", name, label);
++		return false;
++	}
++	if ((base >> 16 & 0xf) != 4) {
++		say("wcn: RPMh: \"%s\" is not a regulator (address %#x): %s NOT touched\n", name, base, label);
++		return false;
++	}
++	/* the read for the record, then the writes one at a time. A voltage of 0 means the
++	 * rail's voltage is not ours to set: the OnePlus 6's DT gives the cx/mx rail (ldoa5)
++	 * no microvolts at all (its min/max are the string form), and the AOP NACKs a write
++	 * that does not fit the resource (the run96 lesson: ldoa5 at 800000 uV was ISSUED
++	 * but never completed, while the mode and the enable took) */
++	if (!rpmh_read(base + VRM_VOLTAGE, &current, name)) {
++		say("wcn: RPMh: %s did not answer a read: writing anyway\n", name);
++	}
++	if (uv != 0 && !rpmh_write(base + VRM_VOLTAGE, uv, label)) {
++		return false;
++	}
++	if (!rpmh_write(base + VRM_MODE, VRM_MODE_LDO_HPM, label)) {
++		return false;
++	}
++	if (!rpmh_write(base + VRM_ENABLE, 1, label)) {
++		return false;
++	}
++	if (uv != 0) {
++		say("wcn: RPMh: %s is \"%s\" at %#x, asked for %u uV (was %#x)\n", label, name, base, uv, current);
++	} else {
++		say("wcn: RPMh: %s is \"%s\" at %#x, the voltage left to the AOP (its register reads %#x)\n", label, name,
++		    base, current);
++	}
++	/* the readback: mode and enable decide (a rail whose mode reads HPM and whose enable
++	 * reads 1 IS on); the voltage register is the AOP's in its own units, not the micro
++	 * volts voted (ldoa5 reads 0x80001500, ldoa7 0x1740 -- the run99 lesson), so a
++	 * mismatch there is said and not failed */
++	uint32_t volt = 0, mode = 0, enable = 0;
++	bool have_v = rpmh_read(base + VRM_VOLTAGE, &volt, name);
++	bool have_m = rpmh_read(base + VRM_MODE, &mode, name);
++	bool have_e = rpmh_read(base + VRM_ENABLE, &enable, name);
++
++	if (have_v && uv != 0 && volt != uv) {
++		say("wcn: RPMh: %s reads %#x after the %u uV vote (the AOP's units, not ours)\n", name, volt, uv);
++	}
++	if ((have_m && mode != VRM_MODE_LDO_HPM) || (have_e && enable != 1)) {
++		say("wcn: RPMh: %s did NOT take it (mode %#x want %#x, ena %#x want 1)\n", name, mode,
++		    VRM_MODE_LDO_HPM, enable);
++		return false;
++	}
++	if (uv != 0) {
++		say("wcn: the %s supply is on (%s, %u uV, HPM)\n", label, name, uv);
++	} else {
++		say("wcn: the %s supply is on (%s, the AOP's voltage, HPM)\n", label, name);
++	}
++	return true;
++}
++
++/* ---- the steps ---------------------------------------------------------------------------------------- */
++
++/* the RMB's registers, printed the way the msm-4.9 driver logs them when something fails */
++static void
++dump_rmb(void)
++{
++	static const struct { uint32_t off; const char *name; } regs[] = {
++		{ RMB_MBA_IMAGE, "MBA_IMAGE" }, { RMB_PBL_STATUS, "PBL_STATUS" },
++		{ RMB_MBA_COMMAND, "MBA_COMMAND" }, { RMB_MBA_STATUS, "MBA_STATUS" },
++		{ RMB_PMI_META_DATA, "PMI_META_DATA" }, { RMB_PMI_CODE_START, "PMI_CODE_START" },
++		{ RMB_PMI_CODE_LENGTH, "PMI_CODE_LENGTH" }, { RMB_MSS_STATUS, "MSS_STATUS" },
++	};
++	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
++		say("wcn: modem: RMB_%s = %#x\n", regs[i].name, rd(RMB(regs[i].off)));
++	}
++}
++
++/* poll one RMB register until (value & mask) == want, MODEM_POLL_US at 100 us a step */
++static bool
++poll_rmb(uint32_t off, uint32_t mask, uint32_t want, uint32_t *got, const char *what)
++{
++	uint32_t value = 0;
++
++	for (int i = 0; i < MODEM_POLL_US / 100; i++) {
++		value = rd(RMB(off));
++		if ((value & mask) == want) {
++			if (got != NULL) {
++				*got = value;
++			}
++			return true;
++		}
++		spin_us(100);
++	}
++	if (got != NULL) {
++		*got = value;
++	}
++	say("wcn: modem: TIMEOUT waiting for %s (last value %#x, want%#x&%#x)\n", what, value, want, mask);
++	return false;
++}
++
++/* ring the AOP with a real edge: the vendor's send_irq is "wmb(); writel_relaxed
++ * (mask, tx_irq_reg)" and it never clears the register -- on a sticky doorbell that
++ * only watches 0->1 transitions, a second write of 1 is a NO EDGE and the AOP stays
++ * deaf (the likely m12/m13 story: ABL rang the doorbell before the reboot and left
++ * the register at 1; our writes of 1 did nothing). So: drop the line, let it settle,
++ * raise it -- and read the register back, its value is evidence either way. */
++static void
++qmp_kick(vm_offset_t doorbell)
++{
++	__asm__ volatile("dsb sy" ::: "memory");
++	wr(doorbell, 0);
++	__asm__ volatile("dsb sy" ::: "memory");
++	wr(doorbell, 1);
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++/* the AOP signal (qcom,signal-aop): the vendor pil_boot's FIRST act, before any vote
++ * or clock. The message is "{class: image, res: load_state, name: modem, val: on}"
++ * (desc->name is the firmware name, "modem"); the vendor's own BHS power-up path is
++ * dead code on the OP6 (cxrail_bhs is never assigned), so THIS message is what makes
++ * the AOP prepare the modem's power domain -- and the four runs that died at the
++ * QDSP6SS DBG_CFG read (m5c/m6/m10/m11) are exactly the runs that reached it without
++ * having sent it. */
++static void
++qmp_desc_dump(vm_offset_t qmp)
++{
++	static const char *names[16] = {
++		"magic", "version", "features", "uc.link",
++		"uc.link_ack", "uc.ch", "uc.ch_ack", "uc.mbox_size",
++		"uc.mbox_off", "mc.link", "mc.link_ack", "mc.ch",
++		"mc.ch_ack", "mc.mbox_size", "mc.mbox_off", "reserved",
++	};
++
++	for (unsigned i = 0; i < 16; i++) {
++		say("wcn: qmp: desc[%2u] %-12s = %#x\n", i, names[i], rd(qmp + 4 * i));
++	}
++}
++
++/* the m23 rider (no boot of its own): the QMP state, four lines per call. The AOP
++ * firmware's RX is NVIC IRQ 2 -> handler 0xb0002d8 (the m22 reverse engineering),
++ * registered once at its boot -- so these words moving DURING a run would mean a
++ * doorbell of ours finally landed; static across the whole run = it never did */
++static void
++qmp_m23_dump(const char *when)
++{
++	vm_offset_t qmp = ml_io_map_unmappable(QMP_PHYS, QMP_SIZE, VM_WIMG_IO);
++	vm_offset_t db = ml_io_map_unmappable(QMP_DOORBELL_PHYS & ~0xffful, 0x1000, VM_WIMG_IO);
++	vm_offset_t bell = db + (QMP_DOORBELL_PHYS & 0xfff);
++
++	if (rd(qmp) != QMP_MAGIC) {
++		say("wcn: qmp m23 %s: no MAIL magic (%#x)\n", when, rd(qmp));
++		return;
++	}
++	say("wcn: qmp m23 %s: uc.link %#x ack %#x ch %#x ack %#x | mc.link %#x ack %#x ch %#x ack %#x\n",
++	    when,
++	    rd(qmp + QMP_UCORE_LINK_STATE), rd(qmp + QMP_UCORE_LINK_ACK),
++	    rd(qmp + QMP_UCORE_CH_STATE), rd(qmp + QMP_UCORE_CH_ACK),
++	    rd(qmp + QMP_MCORE_LINK_STATE), rd(qmp + QMP_MCORE_LINK_ACK),
++	    rd(qmp + QMP_MCORE_CH_STATE), rd(qmp + QMP_MCORE_CH_ACK));
++	say("wcn: qmp m23 %s: mbox off %#x size %#x, len %#x, doorbell reads %#x\n",
++	    when,
++	    rd(qmp + QMP_MCORE_MBOX_OFFSET), rd(qmp + QMP_MCORE_MBOX_SIZE),
++	    rd(qmp + rd(qmp + QMP_MCORE_MBOX_OFFSET)), rd(bell));
++	say("wcn: qmp m23 %s: the APCS page:", when);
++	for (unsigned i = 0; i < 8; i++) {
++		say(" %#x", rd(db + 4 * i));
++	}
++	say("\n");
++}
++
++/* the m27 prelude. The doorbell path is now provably right -- the OP6's own DT
++ * (aop node: irq-reg-base 0x1799000c, irq-mask 0x1), the AOP's own firmware
++ * (writel(1 << mbox_id, 0x8000c) in its TX), the mi8 sibling's working driver
++ * (APCS_IPC 0xc, IPC_AOP BIT0) -- and the msgram desc words are AP-writable and
++ * stick (m22c att0). Twelve runs of ringing still produced nothing. The one
++ * thing never proven: that a write to the APCS page lands AT ALL (+0x14 is
++ * read-only for us -- m26's set and clear both read back as-found). The four
++ * mask words at +0xf0..0xfc are the page's only non-zero, never-zeroed words:
++ * write 1 at +0xf8 and the readback has three outcomes -- 0xfffffffe = W1C,
++ * the write LANDED; 0x1 = plain RW, the write landed; unchanged = every write
++ * to this page is silently dropped and the doorbell rings were never rung.
++ * Then ring the AOP line and watch the masks (a pending bit appearing = the
++ * bell physically fired), and try +0x8, the older SoCs' apcs offset. */
++static void
++qmp_m27_prelude(vm_offset_t db, vm_offset_t doorbell)
++{
++	uint32_t w, v;
++
++	say("wcn: m27: APCS page as-found: +0c %#x +10 %#x +14 %#x +1c %#x\n",
++	    rd(db + 0xc), rd(db + 0x10), rd(db + 0x14), rd(db + 0x1c));
++
++	w = rd(db + 0xf8);
++	wr(db + 0xf8, 0x1);
++	__asm__ volatile("dsb sy" ::: "memory");
++	say("wcn: m27: +f8 write 1: %#x -> reads %#x (fffffffe = W1C landed, 1 = RW, unchanged = dropped)\n",
++	    w, rd(db + 0xf8));
++
++	w = rd(db + 0xf0);
++	wr(db + 0xf0, 0x1);
++	__asm__ volatile("dsb sy" ::: "memory");
++	say("wcn: m27: +f0 write 1: %#x -> reads %#x\n", w, rd(db + 0xf0));
++
++	qmp_kick(doorbell);
++	say("wcn: m27: after the ring: +0c %#x +14 %#x masks +f0..fc: %#x %#x %#x %#x\n",
++	    rd(db + 0xc), rd(db + 0x14), rd(db + 0xf0), rd(db + 0xf4),
++	    rd(db + 0xf8), rd(db + 0xfc));
++
++	v = rd(db + 8);
++	wr(db + 8, 1);
++	__asm__ volatile("dsb sy" ::: "memory");
++	say("wcn: m27: +8 write 1: %#x -> reads %#x; then the 0->1 edge:\n", v, rd(db + 8));
++	wr(db + 8, 0);
++	__asm__ volatile("dsb sy" ::: "memory");
++	wr(db + 8, 1);
++	__asm__ volatile("dsb sy" ::: "memory");
++	say("wcn: m27: +8 after the edge: reads %#x; page +0c %#x +14 %#x +f0 %#x +f8 %#x\n",
++	    rd(db + 8), rd(db + 0xc), rd(db + 0x14), rd(db + 0xf0), rd(db + 0xf8));
++
++	/* the whole page once more, after everything touched it */
++	for (unsigned i = 0; i < 0x40; i += 8) {
++		say("wcn: m27: page[%02x..%02x]:", 4 * i, 4 * i + 0x1c);
++		for (unsigned j = 0; j < 8; j++) {
++			say(" %#x", rd(db + 4 * (i + j)));
++		}
++		say("\n");
++	}
++}
++
++/* the m28 instruments. m27's verdict: the APCS page eats every AP write (the +f8
++ * W1C probe, +f0, the doorbell, the +8 fallback -- all read back as-found, the
++ * masks untouched, the whole page byte-identical after the suite), while the RSC
++ * at 0x179e0000 -- the SAME APSS domain -- took every vote the runs ever made,
++ * and the RMB's writes booted a modem once. So the write path as a whole is fine
++ * and this page is special. Dipper's kernel (a working WiFi on this die) maps the
++ * APCS with plain ml_io_map and rang the doorbell to life; this tree maps it
++ * ml_io_map_unmappable(VM_WIMG_IO). m28 maps the page three ways, writes the +f8
++ * canary through each (with restore), watches FAR/ESR for a swallowed abort, and
++ * if ANY mapping takes the write, replays the m22c handshake through it at once. */
++
++static uint64_t
++far_el1(void)
++{
++	uint64_t v;
++
++	__asm__ volatile("mrs %0, FAR_EL1" : "=r"(v));
++	return v;
++}
++
++static uint64_t
++esr_el1(void)
++{
++	uint64_t v;
++
++	__asm__ volatile("mrs %0, ESR_EL1" : "=r"(v));
++	return v;
++}
++
++static bool
++qmp_m28_canary(const char *name, vm_offset_t page, uint64_t *fa0, uint64_t *ea0,
++    uint64_t *fa1, uint64_t *ea1)
++{
++	uint32_t orig, back;
++
++	/* the page's identity card through THIS mapping: all three must agree */
++	say("wcn: m28: %s: page +0c %#x +10 %#x +14 %#x +1c %#x\n",
++	    name, rd(page + 0xc), rd(page + 0x10), rd(page + 0x14), rd(page + 0x1c));
++	*fa0 = far_el1();
++	*ea0 = esr_el1();
++	orig = rd(page + 0xf8);
++	wr(page + 0xf8, 0x1);
++	__asm__ volatile("dsb sy" ::: "memory");
++	back = rd(page + 0xf8);
++	wr(page + 0xf8, orig);          /* leave the page exactly as we found it */
++	__asm__ volatile("dsb sy" ::: "memory");
++	*fa1 = far_el1();
++	*ea1 = esr_el1();
++	say("wcn: m28: %s: +f8 %#x write 1 -> %#x (%s, restored %#x) | far %llx->%llx esr %llx->%llx\n",
++	    name, orig, back, back != orig ? "LANDED" : "dropped", orig,
++	    *fa0, *fa1, *ea0, *ea1);
++	return back != orig;
++}
++
++static void
++qmp_m28_prelude(void)
++{
++	vm_offset_t a, b, c, qmp;
++	uint64_t fa0, ea0, fa1, ea1, fb0, eb0, fb1, eb1, fc0, ec0, fc1, ec1;
++	bool la, lb, lc;
++
++	a = ml_io_map_unmappable(QMP_DOORBELL_PHYS & ~0xffful, 0x1000, VM_WIMG_IO);
++	b = ml_io_map(QMP_DOORBELL_PHYS & ~0xffful, 0x1000);
++	c = ml_io_map_unmappable(QMP_DOORBELL_PHYS & ~0xffful, 0x1000, VM_WIMG_WCOMB);
++	say("wcn: m28: the APCS page three ways: a unmappable-IO %lx, b ml_io_map %lx, c unmappable-WCOMB %lx\n",
++	    (uint64_t)a, (uint64_t)b, (uint64_t)c);
++	la = qmp_m28_canary("a", a, &fa0, &ea0, &fa1, &ea1);
++	lb = qmp_m28_canary("b", b, &fb0, &eb0, &fb1, &eb1);
++	lc = qmp_m28_canary("c", c, &fc0, &ec0, &fc1, &ec1);
++	say("wcn: m28: verdict: a %s, b %s, c %s\n",
++	    la ? "LANDED" : "dropped", lb ? "LANDED" : "dropped", lc ? "LANDED" : "dropped");
++	if (!la && !lb && !lc) {
++		say("wcn: m28: all three mappings drop the write: the page itself refuses the AP\n");
++		return;
++	}
++
++	/* a mapping that lands: replay the m22c handshake through it on the spot --
++	 * dipper's exact qmp_open opening (echo uc.link, raise mc.link, one-word ring) */
++	qmp = ml_io_map_unmappable(QMP_PHYS, QMP_SIZE, VM_WIMG_IO);
++	if (rd(qmp) != QMP_MAGIC) {
++		say("wcn: m28: no MAIL magic (%#x): nothing to handshake with\n", rd(qmp));
++		return;
++	}
++	{
++		static const uint32_t wo[8] = {
++			QMP_UCORE_LINK_STATE, QMP_UCORE_LINK_ACK, QMP_UCORE_CH_STATE, QMP_UCORE_CH_ACK,
++			QMP_MCORE_LINK_STATE, QMP_MCORE_LINK_ACK, QMP_MCORE_CH_STATE, QMP_MCORE_CH_ACK,
++		};
++		vm_offset_t page = la ? a : (lb ? b : c);
++		uint32_t was[8];
++		bool acked = false;
++
++		say("wcn: m28: mapping %s landed: the m22c handshake through it\n",
++		    la ? "a" : (lb ? "b" : "c"));
++		for (unsigned i = 0; i < 8; i++) {
++			was[i] = rd(qmp + wo[i]);
++		}
++		wr(qmp + QMP_UCORE_LINK_ACK, rd(qmp + QMP_UCORE_LINK_STATE));
++		wr(qmp + QMP_MCORE_LINK_STATE, QMP_UP);
++		wr(qmp + QMP_MCORE_LINK_ACK, QMP_DOWN);
++		wr(page + 0xc, 1);              /* dipper's ring(): one word, the bit */
++		__asm__ volatile("dsb sy" ::: "memory");
++		for (unsigned p = 0; p < 5000; p++) {
++			for (unsigned i = 0; i < 8; i++) {
++				uint32_t now = rd(qmp + wo[i]);
++
++				if (now != was[i]) {
++					say("wcn: m28: ~%ums word%u: %#x -> %#x\n", p / 10, i, was[i], now);
++					was[i] = now;
++					if (i == 5 && now == QMP_UP) {
++						acked = true;
++					}
++				}
++			}
++			if (acked) {
++				break;
++			}
++			spin_us(100);
++		}
++		say("wcn: m28: %s\n", acked ?
++		    "THE LINK ACK CAME THROUGH THE ALTERNATE MAPPING -- the doorbell works" :
++		    "no ack in the 500 ms watch");
++	}
++}
++
++/* the m29 scout. Android's own DT (read through /proc on the live phone) says the
++ * QMP kick IS 0x1799000c bit0 ("qcom,qmp-mbox": reg = msgram 0xc300000 + irq-reg-base
++ * 0x1799000c, qcom,irq-mask 1, AOP's irq is SPI 389) -- but the SAME dump shows
++ * 0x179900f0-0x1799014f claimed as "spi_cfg_regs" (the TZ-owned GIC SPI config words,
++ * which is exactly where our +f0..fc masks live) and NO driver owning 0x17990000-ef
++ * except the four smp2p "remote woke us" nodes at +0xc. So the page straddles TZ
++ * territory: the phone runs fine, its QMP works, OUR context drops every write
++ * silently (m28: three mappings, no abort in FAR/ESR). m29 asks: what execution
++ * state are we in (CurrentEL/SPSel), how far does the TZ window reach (read-only
++ * scan of the APSS neighbourhood), and does the write behave differently as a
++ * 64-bit store or a byte store -- with the RSC, one page over, as the always-writable
++ * control. */
++static void
++qmp_m29_prelude(void)
++{
++	static const struct { const char *name; uint32_t pa; } pages[] = {
++		{ "0x1798f000", 0x1798f000UL },
++		{ "0x17991000", 0x17991000UL },
++		{ "0x17992000", 0x17992000UL },
++		{ "0x179a0000", 0x179a0000UL },         /* the GIC-500's GICD, alive */
++		{ "0x179b0000", 0x179b0000UL },         /* GICR, alive */
++	};
++	uint64_t cel, spsel;
++	vm_offset_t rsc;
++	uint32_t w;
++
++	__asm__ volatile("mrs %0, CurrentEL" : "=r"(cel));
++	__asm__ volatile("mrs %0, SPSel" : "=r"(spsel));
++	say("wcn: m29: CurrentEL=%llx (1=EL1 2=EL2), SPSel=%llx\n", cel >> 2, spsel);
++
++	/* m29i: the five-page scan and the byte/64-bit stores are DISABLED -- the m29f
++	 * deaths say one of them kills the machine outright (too fast for any snapshot
++	 * to catch the log). This cut runs only the zero-risk three: the execution
++	 * state, the RSC control write, and the APCS word write (all m4/m27-proven). */
++	(void)pages;
++	(void)rsc;
++	(void)w;
++#if 0
++	/* the neighbourhood, read-only, named before each read */
++	for (unsigned i = 0; i < sizeof(pages) / sizeof(pages[0]); i++) {
++		vm_offset_t p = ml_io_map_unmappable(pages[i].pa, 0x1000, VM_WIMG_IO);
++
++		say("wcn: m29: read %s at %lx\n", pages[i].name, (uint64_t)pages[i].pa);
++		say("wcn: m29: %s: +0000 %#x +0004 %#x +00f0 %#x +00f8 %#x +0100 %#x +0140 %#x\n",
++		    pages[i].name, rd(p), rd(p + 4), rd(p + 0xf0), rd(p + 0xf8),
++		    rd(p + 0x100), rd(p + 0x140));
++	}
++	/* the APCS page's own spi_cfg window vs the doorbell half */
++	{
++		vm_offset_t db = ml_io_map_unmappable(QMP_DOORBELL_PHYS & ~0xffful, 0x1000, VM_WIMG_IO);
++
++		say("wcn: m29: APCS: +0c %#x +14 %#x (doorbell half) +f0 %#x +100 %#x +140 %#x +14c %#x (spi_cfg half)\n",
++		    rd(db + 0xc), rd(db + 0x14), rd(db + 0xf0), rd(db + 0x100),
++		    rd(db + 0x140), rd(db + 0x14c));
++	}
++#endif
++
++	/* the write semantics, side by side with the always-writable RSC: word, byte,
++	 * and 64-bit stores, each with restore. RSC_TCS(0) TCS_IRQ_CLEAR is write-any
++	 * (W1C), a write of 0 is a no-op the m4-era runs already performed */
++	rsc = ml_io_map_unmappable(RSC_PHYS, 0x1000, VM_WIMG_IO);
++	w = rd(rsc + 0xd00 + TCS_IRQ_CLEAR);
++	wr(rsc + 0xd00 + TCS_IRQ_CLEAR, 0);
++	__asm__ volatile("dsb sy" ::: "memory");
++	say("wcn: m29: RSC control write: TCS_IRQ_CLEAR %#x -> reads %#x (the control that always lands)\n",
++	    w, rd(rsc + 0xd00 + TCS_IRQ_CLEAR));
++
++	/* the APCS page's own spi_cfg window vs the doorbell half: every one of these
++	 * addresses was read by the m26/m27 full-page dumps, so zero risk */
++	{
++		vm_offset_t db0 = ml_io_map_unmappable(QMP_DOORBELL_PHYS & ~0xffful, 0x1000, VM_WIMG_IO);
++
++		say("wcn: m29: APCS: +0c %#x +14 %#x (doorbell half) +f0 %#x +100 %#x +140 %#x +14c %#x (spi_cfg half)\n",
++		    rd(db0 + 0xc), rd(db0 + 0x14), rd(db0 + 0xf0), rd(db0 + 0x100),
++		    rd(db0 + 0x140), rd(db0 + 0x14c));
++	}
++
++	{
++		vm_offset_t db = ml_io_map_unmappable(QMP_DOORBELL_PHYS & ~0xffful, 0x1000, VM_WIMG_IO);
++		uint64_t far0 = far_el1(), esr0 = esr_el1(), far1, esr1;
++		uint32_t orig = rd(db + 0xf8);
++
++		wr(db + 0xf8, 0x1);
++		__asm__ volatile("dsb sy" ::: "memory");
++		say("wcn: m29: APCS word write: +f8 %#x -> %#x\n", orig, rd(db + 0xf8));
++#if 0   /* m30: the byte store is the m29-proven whole-phone killer (APSS QMP takes
++         * no sub-word transactions) -- disabled so a normal-chain run survives to
++         * report the word-write verdict; the byte verdict does not need re-proving */
++		{
++			volatile uint8_t *bp = (volatile uint8_t *)(db + 0xfb);
++
++			*bp = 0x55;
++			__asm__ volatile("dsb sy" ::: "memory");
++			say("wcn: m29: APCS byte write: +fb=0x55 -> word %#x (ffffff55 = landed)\n",
++			    rd(db + 0xf8));
++		}
++#endif
++#if 0
++		{
++			volatile uint64_t *qp = (volatile uint64_t *)(db + 0x8);
++
++			*qp = 0x1;      /* one 64-bit store covering +8..+f, bit32 the doorbell */
++			__asm__ volatile("dsb sy" ::: "memory");
++			say("wcn: m29: APCS 64-bit write: +8 = 1 -> +8 %#x +c %#x (0/1 = landed)\n",
++			    rd(db + 8), rd(db + 0xc));
++		}
++#endif
++		wr(db + 0xf8, orig);
++		__asm__ volatile("dsb sy" ::: "memory");
++		far1 = far_el1();
++		esr1 = esr_el1();
++		say("wcn: m29: far %llx->%llx esr %llx->%llx (a change = one of the stores aborted)\n",
++		    far0, far1, esr0, esr1);
++	}
++}
++
++static bool
++qmp_aop_signal(const char *status)
++{
++	vm_offset_t qmp = ml_io_map_unmappable(QMP_PHYS, QMP_SIZE, VM_WIMG_IO);
++	vm_offset_t db = ml_io_map_unmappable(QMP_DOORBELL_PHYS & ~0xffful, 0x1000, VM_WIMG_IO);
++	vm_offset_t doorbell = db + (QMP_DOORBELL_PHYS & 0xfff);
++	char msg[QMP_MSG_LEN];
++	vm_offset_t mbox;
++	uint32_t mbox_off;
++	int tries;
++
++	say("wcn: qmp: msgram at %lx, doorbell at %lx\n", (uint64_t)qmp, (uint64_t)doorbell);
++	qmp_m27_prelude(db, doorbell);
++	for (tries = 0; tries < 100; tries++) {
++		if (rd(qmp) == QMP_MAGIC) {
++			break;
++		}
++		wait_ms(10);
++	}
++	if (rd(qmp) != QMP_MAGIC) {
++		say("wcn: qmp: no MAIL magic (found %#x): the AOP is not listening\n", rd(qmp));
++		return false;
++	}
++	mbox_off = rd(qmp + QMP_MCORE_MBOX_OFFSET);
++	say("wcn: qmp: magic ok (version %u): ucore link %#x ch %#x, our mbox off %#x size %#x\n",
++	    rd(qmp + 4), rd(qmp + QMP_UCORE_LINK_STATE), rd(qmp + QMP_UCORE_CH_STATE),
++	    mbox_off, rd(qmp + QMP_MCORE_MBOX_SIZE));
++	say("wcn: qmp: mcore link %#x ack %#x ch %#x ack %#x (as found, before we touch it)\n",
++	    rd(qmp + QMP_MCORE_LINK_STATE), rd(qmp + QMP_MCORE_LINK_ACK),
++	    rd(qmp + QMP_MCORE_CH_STATE), rd(qmp + QMP_MCORE_CH_ACK));
++	say("wcn: qmp: the doorbell itself reads %#x before anything\n", rd(doorbell));
++	mbox = qmp + mbox_off;
++
++	/* the m22 forensics. m21 proved an AOP task sweeps every word the AP may write
++	 * back to 0xffff0000 within 1 s (its own uc.link stays UP): the task is ALIVE and
++	 * running, only the doorbell-driven RX half never reacts. Three probes, all
++	 * read-only or canary-level:
++	 *   a  the APCS page dumped as found (the m14 plan, never executed): the real
++	 *      doorbell/status registers may not all sit at +0xc
++	 *   b  the sweep's exact timing: a canary at mc.link polled every 10 ms until
++	 *      swept, five trials -- period, jitter, determinism
++	 *   c  dipper's exact qmp_open replay, three attempts, watching ALL eight state
++	 *      words at 100 us (dipper's qmp_wait cadence) and printing every change --
++	 *      even an ack the sweep erases within one period cannot escape this watch */
++	say("wcn: qmp: m22a: the APCS page as found (doorbell at +0xc):\n");
++	for (unsigned i = 0; i < 8; i++) {
++		say("wcn: qmp:   apcs+%#04x = %#x\n", 4 * i, rd(db + 4 * i));
++	}
++	{
++		unsigned ms;
++
++		say("wcn: qmp: m22b: sweep timing (canary at mc.link, 10 ms polls, 3 s cap):\n");
++		for (unsigned t = 0; t < 5; t++) {
++			uint32_t orig = rd(qmp + QMP_MCORE_LINK_STATE);
++			uint32_t now;
++
++			wr(qmp + QMP_MCORE_LINK_STATE, 0xa5a5a5a5);
++			for (ms = 0; ms < 300; ms++) {
++				now = rd(qmp + QMP_MCORE_LINK_STATE);
++				if (now != 0xa5a5a5a5) {
++					say("wcn: qmp:   trial %u: swept after %u0 ms (now %#x)\n", t, ms, now);
++					break;
++				}
++				spin_us(10000);
++			}
++			if (ms == 300) {
++				say("wcn: qmp:   trial %u: the canary STUCK the whole 3 s (no sweep)\n", t);
++			}
++			wr(qmp + QMP_MCORE_LINK_STATE, orig);
++			spin_us(50000);
++		}
++	}
++	{
++		static const char *wn[8] = {
++			"uc.link", "uc.link_ack", "uc.ch", "uc.ch_ack",
++			"mc.link", "mc.link_ack", "mc.ch", "mc.ch_ack",
++		};
++		static const uint32_t wo[8] = {
++			QMP_UCORE_LINK_STATE, QMP_UCORE_LINK_ACK, QMP_UCORE_CH_STATE, QMP_UCORE_CH_ACK,
++			QMP_MCORE_LINK_STATE, QMP_MCORE_LINK_ACK, QMP_MCORE_CH_STATE, QMP_MCORE_CH_ACK,
++		};
++		bool acked = false;
++
++		for (unsigned att = 0; att < 3 && !acked; att++) {
++			uint32_t was[8];
++			bool moved = false;
++
++			for (unsigned i = 0; i < 8; i++) {
++				was[i] = rd(qmp + wo[i]);
++			}
++			wr(qmp + QMP_UCORE_LINK_ACK, rd(qmp + QMP_UCORE_LINK_STATE));
++			wr(qmp + QMP_MCORE_LINK_STATE, QMP_UP);
++			wr(qmp + QMP_MCORE_LINK_ACK, QMP_DOWN);
++			qmp_kick(doorbell);
++			for (unsigned p = 0; p < 9500; p++) {
++				for (unsigned i = 0; i < 8; i++) {
++					uint32_t now = rd(qmp + wo[i]);
++
++					if (now != was[i]) {
++						say("wcn: qmp: m22c att%u ~%ums %s: %#x -> %#x\n",
++						    att, p / 10, wn[i], was[i], now);
++						was[i] = now;
++						moved = true;
++						if (i == 5 && now == QMP_UP) {
++							acked = true;
++						}
++					}
++				}
++				if (acked) {
++					break;
++				}
++				spin_us(100);
++			}
++			if (!acked) {
++				say("wcn: qmp: m22c att%u: %s in the 1 s watch\n",
++				    att, moved ? "changes above" : "NOT ONE word changed");
++			}
++		}
++		if (acked) {
++			say("wcn: qmp: m22c: THE LINK ACK CAME -- the doorbell works, the sweep was eating it\n");
++		}
++	}
++
++	/* link: echo the AOP's link state into its ack, then raise ours and ring */
++	wr(qmp + QMP_UCORE_LINK_ACK, rd(qmp + QMP_UCORE_LINK_STATE));
++	wr(qmp + QMP_MCORE_LINK_STATE, QMP_UP);
++	wr(qmp + QMP_MCORE_LINK_ACK, QMP_DOWN);
++	wr(qmp + QMP_MCORE_CH_STATE, QMP_DOWN);
++	wr(qmp + QMP_MCORE_CH_ACK, QMP_DOWN);
++	qmp_kick(doorbell);
++	say("wcn: qmp: the doorbell reads %#x after the edge write\n", rd(doorbell));
++	/* the m15 liveness poll, shortened: 33 lines over 10 s -- m15 proved the desc
++	 * is dead still for 30 s, so 10 s is enough to see anything ever move */
++	for (tries = 0; tries < 33; tries++) {
++		uint32_t ml = rd(qmp + QMP_MCORE_LINK_STATE);
++		uint32_t ma = rd(qmp + QMP_MCORE_LINK_ACK);
++		uint32_t mc = rd(qmp + QMP_MCORE_CH_STATE);
++		uint32_t mx = rd(qmp + QMP_MCORE_CH_ACK);
++		uint32_t ul = rd(qmp + QMP_UCORE_LINK_STATE);
++		uint32_t ua = rd(qmp + QMP_UCORE_LINK_ACK);
++		uint32_t uc2 = rd(qmp + QMP_UCORE_CH_STATE);
++		uint32_t ux = rd(qmp + QMP_UCORE_CH_ACK);
++		uint32_t len = rd(qmp + mbox_off);
++
++		if (ma == QMP_UP) {
++			break;
++		}
++		say("wcn: qmp: p%03u ml=%#x ma=%#x mc=%#x mx=%#x ul=%#x ua=%#x uc=%#x ux=%#x len=%#x\n",
++		    tries, ml, ma, mc, mx, ul, ua, uc2, ux, len);
++		if (tries % 3 == 2) {           /* re-ring every ~900 ms */
++			qmp_kick(doorbell);
++		}
++		spin_us(300000);
++	}
++	if (rd(qmp + QMP_MCORE_LINK_ACK) != QMP_UP) {
++		say("wcn: qmp: the link ack never came: trying the TX anyway (m16: the TX was never exercised before -- every earlier run died in the handshake)\n");
++	} else {
++		say("wcn: qmp: link up (ucore ack %#x)\n", rd(qmp + QMP_UCORE_LINK_ACK));
++	}
++
++	/* channel: raise ours; copy any move of the AOP's ch_state into its ack */
++	wr(qmp + QMP_MCORE_CH_STATE, QMP_UP);
++	qmp_kick(doorbell);
++	for (tries = 0; tries < 500; tries++) {
++		uint32_t uc = rd(qmp + QMP_UCORE_CH_STATE);
++
++		if (uc != rd(qmp + QMP_UCORE_CH_ACK)) {
++			wr(qmp + QMP_UCORE_CH_ACK, uc);
++			qmp_kick(doorbell);
++		}
++		if (rd(qmp + QMP_MCORE_CH_STATE) == QMP_UP &&
++		    rd(qmp + QMP_MCORE_CH_ACK) == QMP_UP &&
++		    rd(qmp + QMP_UCORE_CH_STATE) == QMP_UP &&
++		    rd(qmp + QMP_UCORE_CH_ACK) == QMP_UP) {
++			break;
++		}
++		spin_us(10000);
++	}
++	if (rd(qmp + QMP_MCORE_CH_ACK) != QMP_UP) {
++		say("wcn: qmp: the channel never connected: trying the TX anyway (mcore ch %#x/%#x, ucore %#x/%#x)\n",
++		    rd(qmp + QMP_MCORE_CH_STATE), rd(qmp + QMP_MCORE_CH_ACK),
++		    rd(qmp + QMP_UCORE_CH_STATE), rd(qmp + QMP_UCORE_CH_ACK));
++	} else {
++		say("wcn: qmp: channel connected\n");
++	}
++
++	/* the message: data first, then the length word -- the length word's clearing is
++	 * the AOP's ack (it consumed the message) */
++	snprintf(msg, sizeof(msg), "{class: image, res: load_state, name: modem, val: %s}", status);
++	for (unsigned i = 0; i < QMP_MSG_LEN; i += 4) {
++		uint32_t w = (uint32_t)(unsigned char)msg[i] |
++		    ((uint32_t)(unsigned char)msg[i + 1] << 8) |
++		    ((uint32_t)(unsigned char)msg[i + 2] << 16) |
++		    ((uint32_t)(unsigned char)msg[i + 3] << 24);
++
++		wr(mbox + 4 + i, w);
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	wr(mbox, QMP_MSG_LEN);
++	qmp_kick(doorbell);
++	say("wcn: qmp: sent \"%s\" (%u bytes, NUL-padded): waiting for the length word to clear\n",
++	    msg, QMP_MSG_LEN);
++	for (tries = 0; tries < 500; tries++) {
++		if (rd(mbox) == 0) {
++			break;
++		}
++		spin_us(10000);
++	}
++	if (rd(mbox) != 0) {
++		say("wcn: qmp: the AOP did not consume the message (length word %#x)\n", rd(mbox));
++		return false;
++	}
++	say("wcn: qmp: the AOP consumed the message\n");
++	return true;
++}
++
++static bool
++modem_boot(void)
++{
++	uint32_t status;
++
++	/* the night gate: wcn_mstep=N runs only the first N stages of the boot.
++	 * stages 1-4 touch nothing inside the modem's own power domain -- 1 the RPMh
++	 * level votes, 2 the GCC's clocks (the AP's own block), 3 the TCSR/RMB reset
++	 * lines (both must be reachable with the modem dark, or no one could ever boot
++	 * it), 4 the MBA image and its RMB pointer -- and each stops cleanly there.
++	 * stage 5 is where the machine has died three times (the first QDSP6SS access,
++	 * the modem's own clock/power FSM), so it waits for the morning and the
++	 * evidence stage 1 collects. */
++	uint32_t mstep = 8, mclk = 0, swcommit = 0, lvl = 384;
++
++	PE_parse_boot_argn("wcn_mstep", &mstep, sizeof(mstep));
++	PE_parse_boot_argn("wcn_mclk", &mclk, sizeof(mclk));   /* s before each clock access */
++	PE_parse_boot_argn("wcn_sw", &swcommit, sizeof(swcommit)); /* 1 = also commit the SLEEP/WAKE
++	                                                            * TCS sets; OFF by default, the
++	                                                            * m7b suspect (async deaths) */
++	PE_parse_boot_argn("wcn_lvl", &lvl, sizeof(lvl));      /* the cx/mx/mss level: 385 (the DT's
++	                                                        * raw value) is the m8 killer, 384
++	                                                        * (TURBO) is the m4-safe default */
++	if (mstep < 8) {
++		say("wcn: modem: GATED at stage %u of 8 (1 levels 2 gcc 3 resets 4 mba 5 q6 6 pbl 7 meta 8 full)\n",
++		    mstep);
++	}
++
++	/* the m28 mapping A/B and abort watch, before anything else here: does ANY
++	 * mapping of the APCS page take a write? (and if one does, handshake at once) */
++	qmp_m28_prelude();
++	/* the m29 scout: execution state, the TZ window's reach, store-width variants.
++	 * m29i cut: the zero-risk three only (state, RSC control, APCS word store) --
++	 * the m29f deaths fingered the five-page scan or the byte/64-bit stores as
++	 * machine-killers, they come back one cut at a time */
++	qmp_m29_prelude();
++
++	/* the m19 peek (wcn_peek=1), read-only and FIRST, before any vote or clock: the
++	 * vendor boot chain (XBL) may already have booted the modem -- in which case our
++	 * reset dance has been killing a LIVE modem and the QDSP6SS canary deaths are the
++	 * wedged aftermath. The RMB page is m4-proven writable; these reads stay inside it.
++	 * PBL_STATUS 1 = the PBL succeeded; MBA_STATUS 1/2 = the MBA is up. If either ran,
++	 * skip the whole PIL and let the caller probe the membase and scan the SMP2P
++	 * edges -- the prize with zero PIL work. */
++	uint32_t peek = 0;
++
++	PE_parse_boot_argn("wcn_peek", &peek, sizeof(peek));
++	if (peek) {
++		uint32_t pbl = rd(rmb + RMB_PBL_STATUS);
++		uint32_t mba = rd(rmb + RMB_MBA_STATUS);
++
++		say("wcn: modem: the RMB as found (m19 peek): image %#x pbl_status %#x mba_cmd %#x mba_status %#x proto %#x debug %#x alt_reset %#x\n",
++		    rd(rmb + RMB_MBA_IMAGE), pbl, rd(rmb + RMB_MBA_COMMAND), mba,
++		    rd(rmb + 0x1c), rd(rmb + 0x20), rd(rmb + 0x44));
++		if (pbl == 1 || mba == 1 || mba == 2 || mba == 3 || mba == 4) {
++			say("wcn: modem: the PBL/MBA already ran this boot: the modem may be ALIVE\n");
++			say("wcn: modem: skipping the whole PIL: the caller probes the membase and the SMP2P\n");
++			return true;
++		}
++		say("wcn: modem: the RMB says the modem is cold: continuing the PIL\n");
++	}
++
++	/* the m20 gate (wcn_noaop=1): the QMP is provably dead from our context (m12-m19:
++	 * the AOP ignored handshakes, 30 s of doorbell edges and both 96- and 64-byte
++	 * messages), and the m19 peek proved the modem is COLD -- XBL never boots it. So
++	 * the canary deaths were cold-domain reads all along. The last untested lever for
++	 * powering the domain without the AOP signal: the SLEEP/WAKE set commits (the
++	 * AOP applies the WAKE set unconditionally; AMC-only votes may never land the
++	 * rails). m7b/m8 tested the commits with the then-poisoned clocks/level -- never
++	 * with 384 + the fixed clock table. */
++	uint32_t noaop = 0;
++
++	PE_parse_boot_argn("wcn_noaop", &noaop, sizeof(noaop));
++	if (noaop) {
++		say("wcn: modem: wcn_noaop=1: skipping the dead QMP signal (m12-m19 evidence)\n");
++		qmp_m23_dump("as-found");
++		say("wcn: qmp m23: left untouched for the whole run; re-read at the SMP2P scan\n");
++	} else if (!qmp_aop_signal("on")) {
++		say("wcn: modem: the AOP signal failed: stopped before any vote or clock\n");
++		return false;
++	}
++
++	/* the levels. The OP6's own mss node asks for 0x181 = 385 at vdd_cx/mx/mss
++	 * (vdd-*-uV/voltage) -- but the m8 evidence says a RAW 385 is what kills: that run
++	 * voted 385 on the AMC alone (the SLEEP/WAKE sets gated OFF, wcn_sw) and still died
++	 * ~6 s in, inside a pure sleep, exactly like the dual-commit runs; 384 (TURBO) is
++	 * the only level that has never killed (m4: 900 s green through stages 1-4). The
++	 * vendor gets away with 385 because its vote goes through the regulator framework,
++	 * which maps the DT's uV onto a legal ARC level before anything reaches the wire;
++	 * a raw 385's low byte 0x81 is no legal sub-level and the AOP chokes on it in its
++	 * own time. Default 384 (wcn_lvl to override). periph.lvl (the GCC's own island,
++	 * where the prng and boot-rom gates that aborted the t2c/t3 runs live) is voted
++	 * alongside, best effort. ALL of cx/mx/mss are required: without mss.lvl the
++	 * modem's own domain stays off and the first QDSP6/RMB register access takes the
++	 * machine down (the run104 lesson, the 9th EDL) */
++	const struct { const char *name; bool required; } levels[] = {
++		{ "cx.lvl", true }, { "mx.lvl", true }, { "mss.lvl", true },
++		{ "periph.lvl", false },
++	};
++	bool dumped_lvl = false;
++
++	for (unsigned i = 0; i < sizeof(levels) / sizeof(levels[0]); i++) {
++		uint32_t base = rpmh_address(levels[i].name);
++
++		if (base == 0) {
++			say("wcn: modem: no \"%s\" in the command db (%s)\n", levels[i].name,
++			    levels[i].required ? "FATAL" : "continuing without it");
++			if (!dumped_lvl) {
++				cmd_db_dump("lvl");
++				dumped_lvl = true;
++			}
++			if (levels[i].required) {
++				return false;
++			}
++			continue;
++		}
++		if (!rpmh_write(base, lvl, levels[i].name)) {
++			say("wcn: modem: the %s level vote failed: stopped\n", levels[i].name);
++			return false;
++		}
++		say("wcn: modem: %s at %#x voted %u (wcn_lvl; 385 raw is the m8 killer)\n",
++		    levels[i].name, base, lvl);
++	}
++	/* and the same votes into the SLEEP (TCS 2) and WAKE (TCS 5) sets: the Linux core
++	 * commits every sleepable resource to both -- but this whole dance is GATED now
++	 * (wcn_sw=1 to turn it on), because the m7b evidence makes it the prime suspect
++	 * for the asynchronous deaths: that run died ~6 s in, inside a pure sleep, having
++	 * touched NO register after the commit (m5c/m6 died 30-35 s in, also long after
++	 * the writes) -- a drift that fits the AOP acting on the SLEEP/WAKE sets some
++	 * time after the writes and killing the SoC in its own time. The AMC-only path
++	 * is what m4 ran, and m4 lived out its 900 s window without a hiccup */
++	if (swcommit) {
++		for (unsigned i = 0; i < sizeof(levels) / sizeof(levels[0]); i++) {
++			uint32_t base = rpmh_address(levels[i].name);
++			static const int sets[2] = { 2, 5 };    /* SLEEP, WAKE (tcs-config order) */
++
++			if (base == 0) {
++				continue;
++			}
++			for (unsigned s = 0; s < 2; s++) {
++				int m = sets[s];
++
++				wr(RSC_TCS(0) + TCS_IRQ_CLEAR, 1u << m);
++				wr(TCS(m, TCS_CMD_MSGID(0)), MSGID_WRITE_4_BYTES);
++				wr(TCS(m, TCS_CMD_ADDR(0)), base);
++				wr(TCS(m, TCS_CMD_DATA(0)), lvl);
++				wr(TCS(m, TCS_WAIT_FOR_CMPL), 0);
++				wr(TCS(m, TCS_CMD_ENABLE), rd(TCS(m, TCS_CMD_ENABLE)) | 1u);
++				wr_sync(TCS(m, TCS_CONTROL), rd(TCS(m, TCS_CONTROL)) & ~TCS_AMC_MODE_TRIGGER);
++				wr_sync(TCS(m, TCS_CONTROL), rd(TCS(m, TCS_CONTROL)) & ~TCS_AMC_MODE_ENABLE);
++				wr_sync(TCS(m, TCS_CONTROL), TCS_AMC_MODE_ENABLE);
++				wr(TCS(m, TCS_CONTROL), TCS_AMC_MODE_ENABLE | TCS_AMC_MODE_TRIGGER);
++				spin_us(100);
++				wr(TCS(m, TCS_CMD_ENABLE), 0);
++				wr(RSC_TCS(0) + TCS_IRQ_CLEAR, 1u << m);
++			}
++			say("wcn: modem: %s level %u committed to the SLEEP (TCS 2) and WAKE (TCS 5) sets\n",
++			    levels[i].name, lvl);
++		}
++	} else {
++		say("wcn: modem: SLEEP/WAKE sets left alone (wcn_sw not set; the m7b suspect)\n");
++	}
++	/* the votes are fire-and-forget: the AOP ramps cx/mx/mss from retention to TURBO in
++	 * its own time, and the QDSP6SS read below aborts the machine if the domain is still
++	 * dark (the run104 lesson) -- give the rails the time, then read the levels back:
++	 * an AOP that quietly NACK'd the vote (the run96 pattern) shows here, BEFORE the
++	 * first modem-domain register access takes the machine down */
++	wait_ms(200);
++	for (unsigned i = 0; i < sizeof(levels) / sizeof(levels[0]); i++) {
++		uint32_t base = rpmh_address(levels[i].name);
++		uint32_t now = 0;
++
++		if (base != 0 && rpmh_read(base, &now, levels[i].name)) {
++			say("wcn: modem: %s now reads level %u (%s)\n", levels[i].name, now,
++			    now == lvl ? "the level voted" : "NOT the level voted");
++		}
++	}
++
++	if (mstep < 2) {
++		/* the Rosetta stone: the TCS slots as XBL left them. The SLEEP (2,3,4)
++		 * and WAKE (5,6,7) sets still hold the votes the boot chain ran the
++		 * modem with -- the exact msgid/addr/data encoding the AOP accepts for
++		 * cx/mx/mss.lvl, readable without touching a dark domain (9 TCSes x
++		 * 6 slots of the RSC's own registers, AP-owned, all reads safe) */
++		static const char *const tcs_names[] = { "amc0", "amc1", "sleep2", "sleep3",
++			"sleep4", "wake5", "wake6", "wake7", "ctl8" };
++		for (unsigned n = 0; n < 9; n++) {
++			for (unsigned k = 0; k < 6; k++) {
++				uint32_t slot = RSC_TCS(n) + 0x30 + 20 * k;
++				uint32_t msgid = rd(slot), addr = rd(slot + 4), data = rd(slot + 8);
++
++				if (addr != 0 || (data & 0x7fffffff) != 0) {
++					say("wcn: rsc tcs %s slot %u: msgid %#x addr %#x data %#x\n",
++					    tcs_names[n], k, msgid, addr, data);
++				}
++			}
++		}
++		say("wcn: modem: stage 1 done (levels voted and read back): clean stop\n");
++		return true;
++	}
++
++	/* the MSS clocks of the GCC: named before touched, read back after; with
++	 * wcn_mclk=N every access is delayed N s (wall time) so the snapshot race of a
++	 * dying run is guaranteed a frame that names the killer clock. The KIND_VOTE
++	 * entries never write anything but a single ORed bit of the vote register; their
++	 * status words are read-only evidence */
++	for (unsigned i = 0; i < sizeof(mss_clocks) / sizeof(mss_clocks[0]); i++) {
++		if (mclk != 0) {
++			say("wcn: modem: -- sleeping %u s before gcc %s --\n", mclk, mss_clocks[i].name);
++			wait_ms(mclk * 1000);
++		}
++		if (mss_clocks[i].kind == KIND_CBCR) {
++			say("wcn: modem: gcc %s at %#x: reading\n", mss_clocks[i].name, mss_clocks[i].reg);
++			uint32_t r = rd(GCC(mss_clocks[i].reg));
++			say("wcn: modem: gcc %s = %#x: writing bit %u\n", mss_clocks[i].name, r, mss_clocks[i].bit);
++			wr(GCC(mss_clocks[i].reg), r | (1u << mss_clocks[i].bit));
++			say("wcn: modem: gcc %s on (=%#x)\n", mss_clocks[i].name, rd(GCC(mss_clocks[i].reg)));
++		} else {
++			say("wcn: modem: gcc %s: vote reg at %#x is %#x\n",
++			    mss_clocks[i].name, mss_clocks[i].reg, rd(GCC(mss_clocks[i].reg)));
++			wr(GCC(mss_clocks[i].reg), rd(GCC(mss_clocks[i].reg)) | (1u << mss_clocks[i].bit));
++			say("wcn: modem: gcc %s: vote now %#x (bit %u set)\n",
++			    mss_clocks[i].name, rd(GCC(mss_clocks[i].reg)), mss_clocks[i].bit);
++			if (mss_clocks[i].stat != 0) {
++				uint32_t s = rd(GCC(mss_clocks[i].stat));
++
++				say("wcn: modem: gcc %s: halt status %#x (first, read-only)\n",
++				    mss_clocks[i].name, s);
++				for (unsigned k = 0; k < 20; k++) {
++					s = rd(GCC(mss_clocks[i].stat));
++					spin_us(1);
++				}
++				say("wcn: modem: gcc %s: halt status %#x (after 20 reads)\n",
++				    mss_clocks[i].name, s);
++			}
++		}
++	}
++
++	if (mstep < 3) {
++		say("wcn: modem: stage 2 done (the MSS clocks on): clean stop\n");
++		return true;
++	}
++
++	/* the reset cycle, the vendor's exact pil_mss_reset: the FIRST touch of the modem's
++	 * own address space is a READ of QDSP6SS_DBG_CFG (0x4080000+0x18, saved and restored
++	 * around the reset lines) -- it happens BEFORE any reset line is written, with the
++	 * levels voted and the clocks on. That read is the canary that has killed the m5c
++	 * and m6 machines (both named it by dying right after the last clock); if this run
++	 * dies here, the levels or the clocks above are still not what the vendor's state
++	 * was; if it passes, the domain is on and the reset cycle is mundane */
++	if (mclk != 0) {
++		say("wcn: modem: -- sleeping %u s before the QDSP6SS_DBG_CFG canary --\n", mclk);
++		wait_ms(mclk * 1000);
++	}
++	say("wcn: modem: qdsp6 dbg_cfg at %#x: READING (the canary)\n", 0x04080018);
++	uint32_t dbg_cfg = rd(QDSP6(QDSP6SS_DBG_CFG));
++	say("wcn: modem: qdsp6 dbg_cfg = %#x (the canary passed: the modem domain is ours)\n", dbg_cfg);
++
++	/* pil_mss_assert_resets: pdc sync SET (BIT(9)!) -> alt reset -> restart reg;
++	 * 200 us; pil_mss_deassert_resets: restart reg -> 200 us -> alt reset -> pdc CLEAR */
++	say("wcn: modem: tcsr pdc at %#x: setting BIT(9)\n", 0x0b2e0100);
++	wr(tcsr_pdc, rd(tcsr_pdc) | MSS_PDC_MASK);
++	say("wcn: modem: tcsr pdc on (=%#x)\n", rd(tcsr_pdc));
++	say("wcn: modem: rmb alt reset: writing 1\n");
++	wr(RMB(RMB_ALT_RESET), 1);
++	say("wcn: modem: tcsr restart: writing 1\n");
++	wr(tcsr_restart, 1);
++	spin_us(200);
++	say("wcn: modem: tcsr restart: writing 0\n");
++	wr(tcsr_restart, 0);
++	spin_us(200);
++	say("wcn: modem: rmb alt reset: writing 0\n");
++	wr(RMB(RMB_ALT_RESET), 0);
++	say("wcn: modem: tcsr pdc: clearing BIT(9)\n");
++	wr(tcsr_pdc, rd(tcsr_pdc) & ~MSS_PDC_MASK);
++	say("wcn: modem: reset lines cycled\n");
++	say("wcn: modem: qdsp6 dbg_cfg restored to %#x\n", dbg_cfg);
++	wr(QDSP6(QDSP6SS_DBG_CFG), dbg_cfg);
++	if (mstep < 4) {
++		say("wcn: modem: stage 3 done (the reset lines cycled): clean stop\n");
++		return true;
++	}
++
++	/* the MBA's image and an empty debug-policy pointer (pil_mss_reset, self_auth branch) */
++	uint64_t mba_size = 0;
++	const uint8_t *mba = redwood_image_file("fw", "mba.mbn", &mba_size, NULL);
++
++	if (mba == NULL || mba_size == 0 || mba_size > MBA_SIZE) {
++		say("wcn: modem: fw/mba.mbn missing or oversize (%llu): stopped\n", (unsigned long long)mba_size);
++		return false;
++	}
++	memcpy((void *)mba_map, mba, mba_size);
++	__sync_synchronize();
++	wr(RMB(RMB_MBA_IMAGE), MBA_PHYS);
++	wr(RMB(RMB_PMI_CODE_START), 0);
++	wr(RMB(RMB_PMI_CODE_LENGTH), 0);
++	__sync_synchronize();
++	say("wcn: modem: mba.mbn in %#x, RMB_MBA_IMAGE written\n", MBA_PHYS);
++	if (mstep < 5) {
++		say("wcn: modem: stage 4 done (the MBA named to the RMB): clean stop\n");
++		return true;
++	}
++
++	/* start the boot FSM (__pil_q6v65_reset: sleep clock on, core start, boot command).
++	 * The QDSP6SS region already answered the stage-3 canary (DBG_CFG read), so this
++	 * is no longer the historical killer stage -- but every access is still named. */
++	say("wcn: modem: qdsp6 sleep: reading\n");
++	wr(QDSP6(QDSP6SS_SLEEP), rd(QDSP6(QDSP6SS_SLEEP)) | 1u);
++	for (int i = 0; i < 200; i++) {
++		if (!(rd(QDSP6(QDSP6SS_SLEEP)) & (1u << 31))) {
++			break;
++		}
++		spin_us(1);
++	}
++	wr(QDSP6(QDSP6SS_BOOT_CORE_START), 1);
++	__sync_synchronize();
++	wr(QDSP6(QDSP6SS_BOOT_CMD), 1);
++	if (!poll_rmb(RMB_MSS_STATUS, 1u, 1u, NULL, "the boot FSM")) {
++		dump_rmb();
++		return false;
++	}
++	say("wcn: modem: boot FSM done, waiting for the PBL and the MBA\n");
++
++	/* the PBL reports first, then the MBA (pil_msa_wait_for_mba_ready) */
++	if (!poll_rmb(RMB_PBL_STATUS, 0xffffffffu, 0, &status, "PBL status != 0")) {
++		dump_rmb();
++		return false;
++	}
++	say("wcn: modem: PBL status %#x (%s)\n", status, status == PBL_STATUS_SUCCESS ? "success" : "UNEXPECTED");
++	if (status != PBL_STATUS_SUCCESS) {
++		dump_rmb();
++		return false;
++	}
++	if (!poll_rmb(RMB_MBA_STATUS, 0xffffffffu, 0, &status, "MBA status != 0")) {
++		dump_rmb();
++		return false;
++	}
++	say("wcn: modem: MBA status %#x\n", status);
++	if (status != MBA_STATUS_XPU_UNLOCKED && status != MBA_STATUS_SCRIBBLED) {
++		dump_rmb();
++		return false;
++	}
++
++	/* the mdt: its head (headers and program headers) plus its hash segments is the metadata
++	 * (qcom_mdt_read_metadata); the rest of the image arrives as modem.bXX, one per phdr */
++	const uint8_t *mdt = redwood_image_file("fw", "modem.mdt", &(uint64_t){ 0 }, NULL);
++
++	if (mdt == NULL) {
++		say("wcn: modem: no fw/modem.mdt in the ramdisk: stopped\n");
++		return false;
++	}
++	const uint32_t *ehdr = (const uint32_t *)mdt;
++	if (MDT_MAGIC(ehdr) != MDT_ELF_MAGIC || mdt[4] != 1 || MDT_PHOFF(ehdr) != 0x34) {
++		say("wcn: modem: modem.mdt is not a 32-bit ELF at phoff 0x34 (magic %#x class %u phoff %#x): stopped\n",
++		    MDT_MAGIC(ehdr), mdt[4], MDT_PHOFF(ehdr));
++		return false;
++	}
++	uint32_t count = MDT_PHNUM(ehdr);
++	const struct mdt_phdr *phdrs = (const struct mdt_phdr *)(mdt + 0x34);
++
++	if (count == 0 || count > MDT_MAX_SEGMENTS) {
++		say("wcn: modem: %u program headers is out of range: stopped\n", count);
++		return false;
++	}
++	say("wcn: modem: modem.mdt: %u program headers, %u bytes of head\n", count, phdrs[0].filesz);
++	if (phdrs[0].filesz == 0 || phdrs[0].filesz > MDATA_SIZE) {
++		say("wcn: modem: the head is %u bytes, more than the metadata can hold: stopped\n", phdrs[0].filesz);
++		return false;
++	}
++	uint32_t mdsize = phdrs[0].filesz;
++
++	memcpy((void *)mdata_map, mdt, mdsize);
++	for (uint32_t i = 0; i < count; i++) {
++		if (!MDT_IS_HASH(phdrs[i].flags)) {
++			continue;
++		}
++		if (mdsize + phdrs[i].filesz > MDATA_SIZE) {
++			say("wcn: modem: the metadata overflows (%u + %u): stopped\n", mdsize, phdrs[i].filesz);
++			return false;
++		}
++		memcpy((void *)(mdata_map + mdsize), mdt + phdrs[i].offset, phdrs[i].filesz);
++		mdsize += phdrs[i].filesz;
++	}
++	__sync_synchronize();
++	say("wcn: modem: metadata of %u bytes in %#x\n", mdsize, MDATA_PHYS);
++
++	/* hand it over and let the MBA authenticate the headers (pil_msa_auth_modem_mdt) */
++	wr(RMB(RMB_PMI_CODE_LENGTH), 0);
++	wr(RMB(RMB_PMI_META_DATA), MDATA_PHYS);
++	wr(RMB(RMB_MBA_COMMAND), MBA_CMD_META_DATA_READY);
++	if (!poll_rmb(RMB_MBA_STATUS, 0xffffffffu, MBA_STATUS_META_AUTHED, &status, "metadata auth (3)")) {
++		dump_rmb();
++		return false;
++	}
++	say("wcn: modem: metadata authenticated (MBA status %#x)\n", status);
++
++	/* the segments, in phdr order, copied to their real addresses while the MBA hashes them
++	 * (pil_load_seg + pil_msa_mba_verify_blob: the first one also names the image and fires
++	 * LOAD_READY, the length counter counts every memsz) */
++	uint32_t img_length = 0;
++
++	for (uint32_t i = 0; i < count; i++) {
++		if (MDT_IS_HASH(phdrs[i].flags) || phdrs[i].type != MDT_PT_LOAD) {
++			continue;
++		}
++		char name[16];
++
++		snprintf(name, sizeof(name), "modem.b%02u", i);
++		uint64_t size = 0;
++		const uint8_t *data = redwood_image_file("fw", name, &size, NULL);
++
++		if (data == NULL && phdrs[i].filesz != 0) {
++			say("wcn: modem: segment %u (%s) is missing from the ramdisk: stopped\n", i, name);
++			return false;
++		}
++		if (phdrs[i].filesz > size) {
++			say("wcn: modem: segment %u (%s) is %llu bytes, less than its %u: stopped\n", i, name,
++			    (unsigned long long)size, phdrs[i].filesz);
++			return false;
++		}
++		volatile uint8_t *to = (volatile uint8_t *)(mpss_map + (phdrs[i].paddr - MPSS_PHYS));
++
++		say("wcn: modem: segment %u (%s) -> %#x (%u of %u bytes)\n", i, name, phdrs[i].paddr, phdrs[i].filesz,
++		    phdrs[i].memsz);
++		if (phdrs[i].filesz != 0) {
++			memcpy((void *)(uintptr_t)to, data, phdrs[i].filesz);
++		}
++		if (phdrs[i].memsz > phdrs[i].filesz) {
++			memset((void *)(uintptr_t)(to + phdrs[i].filesz), 0, phdrs[i].memsz - phdrs[i].filesz);
++		}
++		__sync_synchronize();
++		if (img_length == 0) {
++			wr(RMB(RMB_PMI_CODE_START), phdrs[i].paddr);
++			wr(RMB(RMB_MBA_COMMAND), MBA_CMD_LOAD_READY);
++		}
++		img_length += phdrs[i].memsz;
++		wr(RMB(RMB_PMI_CODE_LENGTH), img_length);
++		status = rd(RMB(RMB_MBA_STATUS));
++		if ((int32_t)status < 0) {
++			say("wcn: modem: the MBA reported an error (%#x) at segment %u: stopped\n", status, i);
++			dump_rmb();
++			return false;
++		}
++	}
++	say("wcn: modem: %u bytes handed over, waiting for AUTH_COMPLETE\n", img_length);
++
++	/* the MBA has hashed everything: status 4, ten seconds (pil_msa_mba_auth) */
++	if (!poll_rmb(RMB_MBA_STATUS, 0xffffffffu, MBA_STATUS_AUTHED, &status, "auth complete (4)")) {
++		dump_rmb();
++		return false;
++	}
++	say("wcn: modem: the image is authenticated and running (MBA status %#x)\n", status);
++	wait_ms(500);
++	return true;
++}
++
++static void
++probe_membase(void)
++{
++	for (unsigned i = 0; i < sizeof(probe_offsets) / sizeof(probe_offsets[0]); i++) {
++		char name[40];
++
++		snprintf(name, sizeof(name), "membase+%#x", probe_offsets[i]);
++		probe(MEM(probe_offsets[i]), name);
++	}
++}
++
++static void
++probe_smmu(void)
++{
++	uint32_t idr0 = probe(SMMU(SMMU_IDR0), "smmu IDR0");
++	uint32_t idr1 = probe(SMMU(SMMU_IDR1), "smmu IDR1");
++	uint32_t stream_matches = (idr0 & 0x7f) + 1;
++	uint32_t contexts = (idr1 & 0x7f) + 1;
++	int hit = -1;
++
++	say("wcn: smmu: %u stream match registers, %u contexts\n", stream_matches, contexts);
++	/* the stream match table, read only: who serves sid 0x40 today, if anyone */
++	for (uint32_t n = 0; n < stream_matches && n < 128; n++) {
++		uint32_t smr = probe(SMMU(SMMU_SMR(n)), "smmu SMR");
++
++		if (!(smr & 1u << 31)) {
++			continue;
++		}
++		uint32_t stream = smr & 0x7fff, mask = (smr >> 16) & 0x7fff;
++
++		say("wcn: smmu: SMR[%u]: stream %#x mask %#x\n", n, stream, mask);
++		if ((stream & ~mask) == (RADIO_SID & ~mask) && hit < 0) {
++			hit = (int)n;
++		}
++	}
++	if (hit >= 0) {
++		uint32_t s2cr = probe(SMMU(SMMU_S2CR(hit)), "smmu S2CR of the radio's stream");
++
++		say("wcn: smmu: the radio's stream: S2CR %#x (type %u, context %u, privcfg %u)\n", s2cr,
++		    (s2cr >> 16) & 3, s2cr & 0xff, (s2cr >> 24) & 3);
++		if (((s2cr >> 16) & 3) != 2) {
++			uint32_t bank = s2cr & 0xff;
++
++			if (bank < contexts) {
++				char name[40];
++
++				snprintf(name, sizeof(name), "smmu CBAR[%u]", bank);
++				probe(SMMU(SMMU_SECOND_BASE + SMMU_CBAR(bank)), name);
++				snprintf(name, sizeof(name), "smmu CB_SCTLR[%u]", bank);
++				probe(SMMU(SMMU_CB_SCTLR(bank)), name);
++				snprintf(name, sizeof(name), "smmu CB_TTBR0[%u]", bank);
++				probe(SMMU(SMMU_CB_TTBR0(bank)), name);
++			}
++		}
++	} else {
++		say("wcn: smmu: NO stream match serves sid %#x: the radio's traffic would fault (or its stage-1 is on)\n",
++		    RADIO_SID);
++	}
++}
++
++static void
++scan_smp2p(void)
++{
++	uint32_t version = probe(smem + SMEM_VERSION_WORD, "smem version word");
++
++	say("wcn: smem: boot loader's version word %#x (its [31:16] = %u)\n", version, version >> 16);
++	/* the shared memory, scanned for SMP2P: every "$smp2p" is a subsystem's edge, and its
++	 * entries' names say which ("mpss-in"/"mpss-out" are the modem's) */
++	unsigned edges = 0;
++
++	for (uint32_t off = 0; off + 0x40 < SMEM_SIZE; off += 4) {
++		if (rd(smem + off) != SMP2P_MAGIC) {
++			continue;
++		}
++		uint32_t counts = rd(smem + off + SMP2P_COUNTS);
++		uint32_t flags = rd(smem + off + SMP2P_FLAGS);
++		uint32_t valid = counts >> 16;
++
++		edges++;
++		say("wcn: smp2p at %#x: flags %#x, %u entries\n", off, flags, valid);
++		for (uint32_t i = 0; i < valid && i < 8; i++) {
++			char name[17];
++
++			memcpy(name, (const void *)(smem + off + SMP2P_NAME(i)), 16);
++			name[16] = 0;
++			say("wcn: smp2p entry: \"%s\" = %#x\n", name, rd(smem + off + SMP2P_ENTRY_VALUE(i)));
++		}
++	}
++	if (edges == 0) {
++		say("wcn: smem: NO SMP2P edges in %u MB: no subsystem is talking (the modem would be one of them)\n",
++		    SMEM_SIZE >> 20);
++	} else {
++		say("wcn: smem: %u SMP2P edges\n", edges);
++	}
++}
++
++static void
++wcn_thread(__unused void *parameter, __unused wait_result_t result)
++{
++	/* the register blocks as device mappings (the run66 lesson: the kernel's default I/O
++	 * submap is 8 MB, and one 8 MB membase mapping is what crashed the pool), and the
++	 * modem's image memory as write-combining, the bulk of the copying likes it */
++	membase = ml_io_map_unmappable(MEMBASE_PHYS, MEMBASE_SIZE, VM_WIMG_IO);
++	smmu = ml_io_map_unmappable(SMMU_PHYS, SMMU_SIZE, VM_WIMG_IO);
++	smem = ml_io_map_unmappable(SMEM_PHYS, SMEM_SIZE, VM_WIMG_IO);
++	qdsp6 = ml_io_map_unmappable(QDSP6_PHYS, QDSP6_SIZE, VM_WIMG_IO);
++	rmb = ml_io_map_unmappable(RMB_PHYS, RMB_SIZE, VM_WIMG_IO);
++	gcc = ml_io_map_unmappable(GCC_PHYS, GCC_SIZE, VM_WIMG_IO);
++	tcsr_restart = ml_io_map_unmappable(MSS_RESTART_PHYS, 0x1000, VM_WIMG_IO);
++	tcsr_pdc = ml_io_map_unmappable(MSS_PDC_SYNC_PHYS & ~0xffful, 0x1000, VM_WIMG_IO) +
++	    (MSS_PDC_SYNC_PHYS & 0xfff);
++	mba_map = ml_io_map_unmappable(MBA_PHYS, MBA_SIZE, VM_WIMG_WCOMB);
++	mpss_map = ml_io_map_unmappable(MPSS_PHYS, MPSS_SIZE, VM_WIMG_WCOMB);
++	mdata_map = ml_io_map_unmappable(MDATA_PHYS, MDATA_SIZE, VM_WIMG_WCOMB);
++	/* the RPMh: the driver's TCS at the application processor's "DRV 2", and the command
++	 * database, whose physical address the XBL leaves in a scratch word (a page mapped to
++	 * read it, the database itself as write-combining memory) */
++	rsc = ml_io_map_unmappable(RSC_PHYS, RSC_SIZE, VM_WIMG_IO);
++	vm_offset_t scratch = ml_io_map_unmappable(CMD_DB_PHYS & ~0xffful, 0x1000, VM_WIMG_IO);
++	uint32_t db_phys = rd(scratch + (CMD_DB_PHYS & 0xfff));
++
++	cmd_db = db_phys == 0 ? 0 : ml_io_map_unmappable(db_phys & ~0xffful, CMD_DB_SIZE, VM_WIMG_WCOMB);
++	/* a past run's NACK'd command can leave a TCS busy ACROSS the reboot (the loader
++	 * does not reset the RSC -- run97 was blocked by run96's leftover): clear every
++	 * TCS's marks before the first request, make the completion bits visible, and say
++	 * what state the two ACTIVE TCSes were found in */
++	for (int t = 0; t < RPMH_ACTIVE_TCS; t++) {
++		wr(RSC_TCS(t) + TCS_CMD_ENABLE, 0);
++		wr_sync(TCS(t, TCS_CONTROL), rd(TCS(t, TCS_CONTROL)) & ~(TCS_AMC_MODE_TRIGGER | TCS_AMC_MODE_ENABLE));
++		wr(RSC_TCS(0) + TCS_IRQ_CLEAR, 1u << t);
++	}
++	wr(RSC_TCS(0) + TCS_IRQ_ENABLE, (1u << RPMH_ACTIVE_TCS) - 1);
++	say("wcn: RPMh: the ACTIVE TCSes were found with status %#x and %#x\n", rd(RSC_TCS(0) + TCS_STATUS),
++	    rd(RSC_TCS(1) + TCS_STATUS));
++	say("wcn: membase %#lx at %#lx, smmu %#lx at %#lx, smem %#lx at %#lx\n", MEMBASE_PHYS, membase, SMMU_PHYS, smmu,
++	    SMEM_PHYS, smem);
++	say("wcn: qdsp6 %#lx at %#lx, rmb %#lx at %#lx, gcc %#lx at %#lx\n", QDSP6_PHYS, qdsp6, RMB_PHYS, rmb,
++	    GCC_PHYS, gcc);
++	say("wcn: mba %#lx at %#lx, mpss %#lx at %#lx, mdata %#lx at %#lx\n", MBA_PHYS, mba_map, MPSS_PHYS, mpss_map,
++	    MDATA_PHYS, mdata_map);
++	say("wcn: rsc %#lx at %#lx, the command db at %#x mapped %#lx\n", RSC_PHYS, rsc, db_phys, cmd_db);
++	if (!step("mapped")) {
++		goto out;
++	}
++
++	if (step("supplies")) {
++		/* the four rails, one RPMh write at a time (votes are aggregate: re-voting what
++		 * Android left on costs nothing and powers what it left off). The voltages are
++		 * the OnePlus 6's DT init values; the cx/mx rail takes no voltage (see
++		 * rpmh_regulator) */
++		if (!rpmh_regulator("ldoa5", 0, "0.8 V cx/mx") ||
++		    !rpmh_regulator("ldoa7", 1800000, "1.8 V xo") ||
++		    !rpmh_regulator("ldoa17", 1300000, "1.3 V rfa") ||
++		    !rpmh_regulator("ldoa25", 3000000, "3.3 V ch0")) {
++			say("wcn: a supply did not come up: stopped\n");
++			goto out;
++		}
++		wait_ms(10);
++	}
++
++	if (step("rfclk")) {
++		/* the vendor DT's icnss node has NO clock property at all: Android's own stack
++		 * does not vote this from the AP (the reference comes with the modem's RF, the
++		 * AOP keeps it). Vote it when the command database has one, dump what "clk"
++		 * entries there are for the evidence, and go on either way (the run100 lesson:
++		 * stopping here buried the whole bring-up) */
++		static const char *names[] = { "rfclkd2", "rfclkd1", "rfclkd3", "rfclk2", "rf_clk2", NULL };
++		uint32_t base = 0;
++		const char *found = NULL;
++
++		for (int n = 0; names[n] != NULL && base == 0; n++) {
++			base = rpmh_address(names[n]);
++			if (base != 0) {
++				found = names[n];
++			}
++		}
++		if (base == 0) {
++			cmd_db_dump("clk");
++			say("wcn: RPMh: no rfclk resource: the reference clock not voted (not fatal)\n");
++		} else {
++			uint32_t current = 0;
++
++			if (!rpmh_read(base, &current, found)) {
++				say("wcn: RPMh: %s did not answer a read: writing anyway\n", found);
++			}
++			if (!rpmh_write(base, 19200000, found)) {
++				say("wcn: RPMh: %s did not take the vote (not fatal)\n", found);
++			} else {
++				say("wcn: the radio's reference clock is on (%s at %#x, 19200000 Hz, was %#x)\n", found, base, current);
++			}
++			wait_ms(10);
++		}
++	}
++
++	if (step("probe membase")) {
++		/* a cold read of the block hangs the SNOC while the block is clock-gated: only
++		 * with wcn_probe_membase=1 (the "is it really gated" experiment) */
++		if (probe_membase_gate) {
++			probe_membase();
++		} else {
++			say("wcn: the membase probed NOT (still clock-gated before the firmware; wcn_probe_membase=1 to try)\n");
++		}
++	}
++
++	if (step("probe smmu")) {
++		probe_smmu();
++	}
++
++	if (step("modem")) {
++		modem_up = modem_boot();
++		if (!modem_up) {
++			say("wcn: the modem did not come up: the membase probe is staying off\n");
++		}
++	}
++
++	if (step("probe again")) {
++		/* the firmware now owns the block: its reads are the proof of life (only after
++		 * a modem that actually booted -- otherwise this is the clock-gated hang again) */
++		if (modem_up) {
++			probe_membase();
++		} else {
++			say("wcn: the membase probed NOT (no running firmware behind it)\n");
++		}
++		scan_smp2p();
++		/* the m23 second look: if ANY doorbell of ours landed during the run, the
++		 * words below differ from the as-found print at the start of the modem step */
++		qmp_m23_dump("after the run");
++	}
++out:
++	say("wcn: done\n");
++	thread_terminate(current_thread());
++}
++
++void
++redwood_wcn3990_init(void)
++{
++	thread_t thread;
++
++	/* the OnePlus 6 only: told apart by its framebuffer, as the buttons are (redwood_buttons.c) */
++	if (PE_state.video.v_baseAddr != 0x9D400000) {
++		return;
++	}
++	if (!PE_parse_boot_argn("wcn", &level, sizeof(level)) || level == 0) {
++		return;
++	}
++	PE_parse_boot_argn("wcn_step", &step_limit, sizeof(step_limit));
++	PE_parse_boot_argn("wcn_slow", &slow, sizeof(slow));    /* 1 = 8 s between the steps */
++	PE_parse_boot_argn("wcn_probe_membase", &probe_membase_gate, sizeof(probe_membase_gate));
++	if (kernel_thread_start(wcn_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
+diff --git a/xnu/files/bsd/sys/redwood_input.h b/xnu/files/bsd/sys/redwood_input.h
+index dd68b44..ae7846c 100644
+--- a/xnu/files/bsd/sys/redwood_input.h
++++ b/xnu/files/bsd/sys/redwood_input.h
+@@ -79,6 +79,8 @@ void redwood_adreno_quiesce(void);      /* on the way back to the loader: the GP
+ void redwood_adreno_stop(void);         /* before that, where the ending is no panic's: the GPU given back in order */
+ void redwood_adreno_minute(void);       /* once a minute: a line about how warm the GPU is, if it is in use */
+ void redwood_wifi_init(void);           /* boot-arg wifi=1: the phone's Wi-Fi; wifi_step=N: the first N steps of it */
++void redwood_wcn3990_init(void);        /* boot-arg wcn=1: the OnePlus 6's radio (WCN3990, on the SNOC), brought up as far as its probes; wcn_step=N: the first N steps of it (bsd/dev/redwood_wcn3990.c) */
++void redwood_pcie_init(void);           /* boot-arg pcie=1: the OnePlus 6's PCIe root complex 0, as far as its probes (archived: the radio turned out to live on the SNOC, not PCIe); pcie_step=N: the first N steps (bsd/dev/redwood_pcie.c) */
+ void redwood_adsp_init(void);           /* boot-arg adsp=1: the phone's audio DSP started and linked; adsp_step=N: the first N steps */
+ void redwood_wifi_stop(void);           /* where a run ends in order: the Wi-Fi DSP, if it was started, shut down */
+ int redwood_wifi_say(const char *format, ...) __printflike(1, 2);      /* a line of the Wi-Fi steps' log */
+-- 
+2.53.0
+

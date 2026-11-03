@@ -1,0 +1,32 @@
+From 0d6fdb8d9b88a91951a66573e2c57e935a6277fd Mon Sep 17 00:00:00 2001
+From: oxjmo <oxjmo@localhost>
+Date: Sat, 31 Oct 2026 05:45:06 +0000
+Subject: [PATCH 6/7] xnuloader: reserve 224 MB for the payload
+
+Bumped from 64 MB: the resident root for the normal-boot chain is a
+63 MB root.apfs (the modem firmware alone is 58 MB), and the USB
+download limit is the reservation minus 1 MB.
+---
+ xnuloader/loader.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/xnuloader/loader.c b/xnuloader/loader.c
+index d951310..10a2083 100644
+--- a/xnuloader/loader.c
++++ b/xnuloader/loader.c
+@@ -39,7 +39,11 @@ struct payload_entry { char name[16]; uint32_t size; uint32_t reserved; };
+ #define PANIC_LOG_SIZE      0x80000u
+ #define NVRAM_BANK_SIZE     0x2000u
+ #define PANIC_LOG_BASE      (PAYLOAD_BASE + PAYLOAD_MAX_SIZE - 0x100000ULL)
+-#define PAYLOAD_MAX_SIZE    0x04000000ULL         /* RAM reserved for the payload in the UEFI memory map */
++#define PAYLOAD_MAX_SIZE    0x0E000000ULL         /* RAM reserved for the payload in the UEFI memory map
++                                                 * (bumped from 0x04000000: run90's ramdisk is a 63 MB
++                                                 * root.apfs with the modem firmware in it -- the USB
++                                                 * download limit is this minus 1 MB, and the modem
++                                                 * firmware alone is 58 MB) */
+ 
+ /* ------------------------------------------------------------------------ */
+ /* XNU structures (pexpert/pexpert/arm64/boot.h, mach-o/loader.h)           */
+-- 
+2.53.0
+

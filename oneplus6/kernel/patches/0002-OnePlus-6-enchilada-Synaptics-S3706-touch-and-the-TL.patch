@@ -1,0 +1,1706 @@
+From 2e410e75965abbd21724585daaf4f91336dd71ec Mon Sep 17 00:00:00 2001
+From: oxjmo <oxjmo@localhost>
+Date: Mon, 26 Oct 2026 14:50:06 +0000
+Subject: [PATCH 2/7] OnePlus 6 (enchilada): Synaptics S3706 touch and the TLMM
+ east tile
+
+The touch screen answers on BLSP12 once its 2.8V (cmd-db ldoa28) and
+1.8V VDDIO rails are up; both GPIOs live in the TLMM east tile, whose
+base is not the node address the device tree prints but what the driver
+of the south tile reads back from it -- writing the node address is what
+bricked the phone five times. redwood_s3320.c maps each tile by name,
+serves normalized samples to /dev/redwood-touch, and the loader pokes
+the rails on the east tile as well.
+---
+ xnu/files/bsd/dev/redwood_buttons.c |  117 ++-
+ xnu/files/bsd/dev/redwood_goodix.c  |    5 +-
+ xnu/files/bsd/dev/redwood_input.c   |    1 +
+ xnu/files/bsd/dev/redwood_s3320.c   | 1031 +++++++++++++++++++++++++++
+ xnu/files/bsd/sys/redwood_input.h   |    1 +
+ xnu/redwood.patch                   |   11 +-
+ xnuloader/loader.c                  |  298 +++++++-
+ 7 files changed, 1432 insertions(+), 32 deletions(-)
+ create mode 100644 xnu/files/bsd/dev/redwood_s3320.c
+
+diff --git a/xnu/files/bsd/dev/redwood_buttons.c b/xnu/files/bsd/dev/redwood_buttons.c
+index 0bb4555..7261ea7 100644
+--- a/xnu/files/bsd/dev/redwood_buttons.c
++++ b/xnu/files/bsd/dev/redwood_buttons.c
+@@ -1,8 +1,21 @@
++#include <pexpert/pexpert.h>
++
+ /*
+  * The buttons of the POCO X5 Pro (redwood) -- power, volume up, volume down -- as a source of
+  * button records for /dev/redwood-touch (sys/redwood_input.h). Only with boot-arg buttons=1:
+  * every address below belongs to this phone.
+  *
++ * On the OnePlus 6 (enchilada) the same code drives that phone's three keys, whose inputs are
++ * those of its one PMIC (the PM8998): the driver is told the two phones apart by the framebuffer
++ * base their UEFI reports, the way xnuloader does (loader.c, "platform.fb_base"):
++ *   power        KPDPWR_N of the power-on block ("PON") of the PM8998 (the older generation of
++ *                the block: the same status register, bit 0 instead of bit 7)
++ *   volume down  GPIO5 of the PM8998, pulled up; the key pulls it low. Not the power-on block's
++ *                RESIN: that one is not wired to a key on this phone (the real thing was learned
++ *                by pressing the keys). The device tree has a "key_home" on GPIO5 too, a leftover
++ *                mislabel -- this phone has no home key
++ *   volume up    GPIO6 of the PM8998, the same way
++ *
+  * None of the three is a pin of the SoC. They are inputs of two of the power management chips:
+  *   power        KPDPWR_N of the power-on block ("PON") of the PMK8350
+  *   volume down  RESIN_N of the same block
+@@ -149,8 +162,16 @@ struct peripheral {
+ 	uint16_t        channel;
+ 	bool            found;
+ };
++/*
++ * The POCO's keys; on the OnePlus 6 redwood_buttons_init() replaces these with that phone's
++ * (all of the PM8998, slave 0).
++ */
+ static struct peripheral pon = { .name = "the PMK8350's power-on block", .id = 0x013 };          /* registers 0x1300 of slave 0 */
+ static struct peripheral pin = { .name = "GPIO6 of the PM7325", .id = 0x18d };                   /* registers 0x8d00 of slave 1 */
++static struct peripheral pin_g5 = { .name = "GPIO5 of the PM8998", .id = 0 };                    /* the OnePlus 6's volume down */
++static bool enchilada;           /* the OnePlus 6: told apart by its framebuffer, as the loader does */
++static uint8_t pon_kpdpwr = 0x80, pon_resin = 0x40;     /* the PON's status bits: the PMK8350's generation */
++                                                 /* (on the OnePlus 6 resin is 0: no key is wired there) */
+ 
+ /* How the reads have gone: said once a minute. */
+ static struct {
+@@ -336,8 +357,10 @@ buttons_poll(void)
+ 	if (power.usable || volume_down.usable) {
+ 		problem = spmi_read(&pon, REG_RT_STATUS, &status, 1);
+ 		if (problem == NULL) {
+-			button_look(&power, status & PON_KPDPWR);
+-			button_look(&volume_down, status & PON_RESIN);
++			button_look(&power, status & pon_kpdpwr);
++			if (pon_resin != 0) {
++				button_look(&volume_down, status & pon_resin);
++			}
+ 		} else if (said < 8) {
+ 			said++;
+ 			printf("buttons: reading %s: %s\n", pon.name, problem);
+@@ -352,6 +375,16 @@ buttons_poll(void)
+ 			printf("buttons: reading %s: %s\n", pin.name, problem);
+ 		}
+ 	}
++	if (enchilada && volume_down.usable) {
++		/* the OnePlus 6's volume down is GPIO5, not the power-on block's RESIN */
++		problem = spmi_read(&pin_g5, REG_RT_STATUS, &status, 1);
++		if (problem == NULL) {
++			button_look(&volume_down, !(status & GPIO_LEVEL));
++		} else if (said < 8) {
++			said++;
++			printf("buttons: reading %s: %s\n", pin_g5.name, problem);
++		}
++	}
+ }
+ 
+ /* Step 3: is each peripheral what the registers above are those of? */
+@@ -386,7 +419,8 @@ pon_inputs(void)
+ 	const char *problem;
+ 	uint8_t r[8], more[2];
+ 
+-	printf("buttons: next: read the status and the interrupt setup of %s (registers 0x1310 to 0x1319)\n", pon.name);
++	printf("buttons: next: read the status and the interrupt setup of %s (registers 0x%02x10 to 0x%02x19)\n", pon.name,
++	    pon.id & 0xff, pon.id & 0xff);
+ 	problem = spmi_read(&pon, REG_RT_STATUS, r, 8);
+ 	if (problem == NULL) {
+ 		problem = spmi_read(&pon, REG_INT_LATCHED, more, 2);
+@@ -396,52 +430,56 @@ pon_inputs(void)
+ 		return;
+ 	}
+ 	printf("buttons: power-on block: status %#x (power %s, volume down %s); interrupts: edge %#x, high %#x, low %#x, "
+-	    "enabled %#x, latched %#x, pending %#x\n", r[0], (r[0] & PON_KPDPWR) ? "HELD" : "released",
+-	    (r[0] & PON_RESIN) ? "HELD" : "released", r[REG_INT_SET_TYPE - REG_RT_STATUS], r[REG_INT_POLARITY_HIGH - REG_RT_STATUS],
++	    "enabled %#x, latched %#x, pending %#x\n", r[0], (r[0] & pon_kpdpwr) ? "HELD" : "released",
++	    (r[0] & pon_resin) ? "HELD" : "released", r[REG_INT_SET_TYPE - REG_RT_STATUS], r[REG_INT_POLARITY_HIGH - REG_RT_STATUS],
+ 	    r[REG_INT_POLARITY_LOW - REG_RT_STATUS], r[REG_INT_ENABLED - REG_RT_STATUS], more[0], more[1]);
+-	power.usable = volume_down.usable = true;
+-	power.last = r[0] & PON_KPDPWR;
+-	volume_down.last = r[0] & PON_RESIN;
++	power.usable = true;
++	power.last = r[0] & pon_kpdpwr;
++	if (pon_resin != 0) {
++		volume_down.usable = true;
++		volume_down.last = r[0] & pon_resin;
++	}
+ }
+ 
+-/* Step 4 for the pin: it is volume up only if it is an input with a pull-up, and switched on. */
++/* Step 4 for one of the pins: it is a key only if it is an input with a pull-up, and switched on. */
+ static void
+-pin_input(void)
++pin_input(struct peripheral *p, struct button *b, const char *what)
+ {
+ 	const char *problem;
+ 	uint8_t c[8], status = 0;
+ 	unsigned mode, pull;
+ 
+-	printf("buttons: next: read the setup and the level of %s (registers 0x8d40 to 0x8d47, 0x8d10)\n", pin.name);
+-	problem = spmi_read(&pin, GPIO_REG_MODE, c, 8);
++	printf("buttons: next: read the setup and the level of %s (registers 0x%02x40 to 0x%02x47, 0x%02x10)\n", p->name,
++	    p->id & 0xff, p->id & 0xff, p->id & 0xff);
++	problem = spmi_read(p, GPIO_REG_MODE, c, 8);
+ 	if (problem == NULL) {
+-		problem = spmi_read(&pin, REG_RT_STATUS, &status, 1);
++		problem = spmi_read(p, REG_RT_STATUS, &status, 1);
+ 	}
+ 	if (problem != NULL) {
+-		printf("buttons: %s: %s\n", pin.name, problem);
++		printf("buttons: %s: %s\n", p->name, problem);
+ 		return;
+ 	}
+ 	mode = c[0] & 3;
+ 	pull = c[GPIO_REG_PULL - GPIO_REG_MODE] & 7;
+-	printf("buttons: volume up's pin: mode %u (%s), supply %u, pull %u (%s), %s; registers 0x40.. = %02x %02x %02x %02x %02x %02x "
+-	    "%02x %02x; level %s\n", mode, mode == 0 ? "input" : mode == 1 ? "output" : mode == 2 ? "input and output" : "analog",
++	printf("buttons: %s's pin: mode %u (%s), supply %u, pull %u (%s), %s; registers 0x40.. = %02x %02x %02x %02x %02x %02x "
++	    "%02x %02x; level %s\n", what, mode, mode == 0 ? "input" : mode == 1 ? "output" : mode == 2 ? "input and output" : "analog",
+ 	    c[GPIO_REG_SUPPLY - GPIO_REG_MODE] & 7, pull, pull < 4 ? "up" : pull == 4 ? "down" : "none",
+ 	    (c[GPIO_REG_ENABLE - GPIO_REG_MODE] & 0x80) ? "enabled" : "DISABLED", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7],
+ 	    (status & GPIO_LEVEL) ? "high (released)" : "LOW (held)");
+ 	if (mode != 0 || pull >= 4 || !(c[GPIO_REG_ENABLE - GPIO_REG_MODE] & 0x80)) {
+-		printf("buttons: volume up's pin is not an enabled input with a pull-up. Making it one is a write to the PMIC, "
+-		    "which this driver does not do: volume up is left alone\n");
++		printf("buttons: %s's pin is not an enabled input with a pull-up. Making it one is a write to the PMIC, "
++		    "which this driver does not do: the key is left alone\n", what);
+ 		return;
+ 	}
+-	volume_up.usable = true;
+-	volume_up.last = !(status & GPIO_LEVEL);
++	b->usable = true;
++	b->last = !(status & GPIO_LEVEL);
+ }
+ 
+ static void
+ say_summary(void)
+ {
+-	printf("buttons: so far %u presses of power, %u of volume up, %u of volume down; now%s%s%s%s; %llu reads of the bus, "
+-	    "%llu us each (the longest %llu), %llu failed\n", power.presses, volume_up.presses, volume_down.presses,
++	printf("buttons: so far %u presses of power, %u of volume up, %u of volume down; now%s%s%s%s; %llu reads of "
++	    "the bus, %llu us each (the longest %llu), %llu failed\n", power.presses, volume_up.presses, volume_down.presses,
+ 	    power.down ? " power" : "", volume_up.down ? " volume-up" : "", volume_down.down ? " volume-down" : "",
+ 	    (power.down || volume_up.down || volume_down.down) ? " held" : " none held", bus.reads,
+ 	    bus.reads ? bus.total_ns / bus.reads / 1000 : 0, bus.longest_ns / 1000, bus.failed);
+@@ -451,7 +489,7 @@ static void
+ buttons_thread(void *parameter, __unused wait_result_t result)
+ {
+ 	uint32_t steps = (uint32_t)(uintptr_t)parameter, version, channels;
+-	bool pon_known, pin_known;
++	bool pon_known, pin_known, pin_g5_known = false;
+ 
+ 	printf("buttons: step 1: map the PMIC arbiter (%#lx, %#lx, %#lx) and read its version\n", ARB_CORE_PHYS, ARB_CNFG_PHYS,
+ 	    ARB_OBSERVER_PHYS);
+@@ -475,13 +513,24 @@ buttons_thread(void *parameter, __unused wait_result_t result)
+ 	printf("buttons: step 2: look through the arbiter's table for the channels of the two peripherals\n");
+ 	find_channel(&pon, channels);
+ 	find_channel(&pin, channels);
++	if (enchilada) {
++		find_channel(&pin_g5, channels);
++	}
+ 	if (steps < 3) {
+ 		goto out;
+ 	}
+ 
+ 	printf("buttons: step 3: the first transfers on the SPMI bus\n");
+-	pon_known = identify(&pon, PON_TYPE, PON_SUBTYPE_HLOS, PON_SUBTYPE_HLOS);
++	if (enchilada) {
++		/* the PM8998's power-on block is the older generation: its subtype is 4, not "HLOS" */
++		pon_known = identify(&pon, PON_TYPE, 0x01, 0x04);
++	} else {
++		pon_known = identify(&pon, PON_TYPE, PON_SUBTYPE_HLOS, PON_SUBTYPE_HLOS);
++	}
+ 	pin_known = identify(&pin, GPIO_TYPE, GPIO_SUBTYPE_LV, GPIO_SUBTYPE_MV_VIN3);
++	if (enchilada && pin_g5.found) {
++		pin_g5_known = identify(&pin_g5, GPIO_TYPE, GPIO_SUBTYPE_LV, GPIO_SUBTYPE_MV_VIN3);
++	}
+ 	if (steps < 4) {
+ 		goto out;
+ 	}
+@@ -491,7 +540,10 @@ buttons_thread(void *parameter, __unused wait_result_t result)
+ 		pon_inputs();
+ 	}
+ 	if (pin_known) {
+-		pin_input();
++		pin_input(&pin, &volume_up, "volume up");
++	}
++	if (pin_g5_known) {
++		pin_input(&pin_g5, &volume_down, "volume down");
+ 	}
+ 	if (!power.usable && !volume_up.usable) {
+ 		printf("buttons: nothing that can be read: no buttons\n");
+@@ -553,6 +605,21 @@ redwood_buttons_init(void)
+ 	if (steps == 0) {
+ 		return;
+ 	}
++
++	/*
++	 * Whose keys? The framebuffer base that the loader has put in the boot video (the physical
++	 * address the phone's UEFI reported) tells the phones apart, the way xnuloader does
++	 * (loader.c picks "platform" from the same field).
++	 */
++	enchilada = PE_state.video.v_baseAddr == 0x9D400000;
++	if (enchilada) {
++		pon = (struct peripheral){ .name = "the PM8998's power-on block", .id = 0x008 };
++		pin = (struct peripheral){ .name = "GPIO6 of the PM8998", .id = 0x0c5 };
++		pin_g5 = (struct peripheral){ .name = "GPIO5 of the PM8998", .id = 0x0c4 };
++		pon_kpdpwr = 0x01;
++		pon_resin = 0;          /* no key on the RESIN line of this phone: its volume down is GPIO5 */
++		printf("buttons: the OnePlus 6: power in the PM8998's power-on block, volume up and down in its GPIOs 6 and 5\n");
++	}
+ 	if (kernel_thread_start(buttons_thread, (void *)(uintptr_t)steps, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
+diff --git a/xnu/files/bsd/dev/redwood_goodix.c b/xnu/files/bsd/dev/redwood_goodix.c
+index f969cbd..2e0c169 100644
+--- a/xnu/files/bsd/dev/redwood_goodix.c
++++ b/xnu/files/bsd/dev/redwood_goodix.c
+@@ -1505,7 +1505,10 @@ redwood_goodix_init(void)
+ 	uint32_t enabled = 0;
+ 	thread_t thread;
+ 
+-	if (!PE_parse_boot_argn("touchscreen", &enabled, sizeof(enabled)) || !enabled) {
++	/* this driver is the POCO's (its every address belongs to an sm8350); touchscreen=2 and 3
++	 * are the OnePlus 6's, for the Synaptics (bsd/dev/redwood_s3320.c) -- anything else here
++	 * writes an sm8350's registers on an sdm845 and takes the machine down */
++	if (!PE_parse_boot_argn("touchscreen", &enabled, sizeof(enabled)) || enabled != 1) {
+ 		return;
+ 	}
+ 	PE_parse_boot_argn("touch_flip", &flip, sizeof(flip));
+diff --git a/xnu/files/bsd/dev/redwood_input.c b/xnu/files/bsd/dev/redwood_input.c
+index 5009af3..ae67988 100644
+--- a/xnu/files/bsd/dev/redwood_input.c
++++ b/xnu/files/bsd/dev/redwood_input.c
+@@ -217,6 +217,7 @@ redwood_input_init(void)
+ 	redwood_cpufreq_init();
+ 	redwood_virtio_input_init();
+ 	redwood_goodix_init();
++	redwood_s3320_init();
+ 	redwood_buttons_init();
+ 	redwood_battery_init();
+ 	redwood_ufs_init();
+diff --git a/xnu/files/bsd/dev/redwood_s3320.c b/xnu/files/bsd/dev/redwood_s3320.c
+new file mode 100644
+index 0000000..2967685
+--- /dev/null
++++ b/xnu/files/bsd/dev/redwood_s3320.c
+@@ -0,0 +1,1031 @@
++/*
++ * The touch screen of the OnePlus 6 (enchilada): a Synaptics S3706, spoken to over I2C with
++ * RMI4, the protocol Synaptics calls "register mapped interface". Everything below was learned
++ * from the phone's Android device tree, its Android kernel's driver (OnePlus's
++ * "synaptics_driver_s3320"), the mainline rmi4 driver's quirks for this very chip (the
++ * patch series of July 2025, which documents the chip as answering "S3706B") and, at
++ * touchscreen=2, the chip itself:
++ *
++ *   I2C       address 0x20, 400 kHz under Android. Done by hand here -- bit by bit over the
++ *             pins, as for the haptic chip (redwood_haptic.c): the serial engine at 0xa90000
++ *             is left alone, its two pins taken for each transaction and given back as they
++ *             were found.
++ *   data      GPIO 49, clock GPIO 50 (the engine's pins; pull-ups while the bus is used)
++ *   reset     GPIO 99, high = running
++ *   supplies  2.8 V ("avdd") from LDO 28 of the PM8998, asked for by vote in RPMh as "ldo28"
++ *             (the way the POCO's I/O supply is asked for, redwood_goodix.c); 1.8 V ("vddio")
++ *             from a load switch on GPIO 88, high = on. Android's order: 2.8 V, 10 ms, 1.8 V,
++ *             10 ms, the reset line high 10 ms, low 10 ms, high, and ~200 ms until it answers
++ *   interrupt GPIO 125, pulled up, LOW when the chip has something to say (not an interrupt
++ *             here: looked at, as the haptic chip's line is)
++ *   the glass 1080 x 2160 (the device tree's numbers)
++ *
++ * RMI4 is pages of 256 registers: register 0xff of each page says which page it is, and each
++ * page's registers hold a "page description table" of 6-byte entries: the addresses of a
++ * function's query, command, control and data registers, its interrupt source count, and its
++ * number -- 0x01 the device, 0x12 the 2D touch sensor, 0x34 the firmware updater... The table
++ * is walked from register 0xe9 downwards, 6 bytes at a time (the Android driver hardcodes
++ * F34 at 0xe9, F01 at 0xe3, F12 at 0xdd), until an entry's number is 0.
++ *
++ * Nothing here is done unless a boot-arg asks for it (the same boot-arg the POCO's touch
++ * screen answers to; the phones are told apart by their framebuffer, as the buttons are):
++ *
++ *   touchscreen=1   a look, reading only: the pins, and whether the chip answers. Out of
++ *                   Android's bootloader the supplies are off and the chip does not answer.
++ *   touchscreen=2   ... and the supplies on, the chip probed (its product id and its page 0
++ *                   table shown). Nothing is written to the chip but its page register.
++ *   touchscreen=3   ... and the chip brought out of its sleep and told to interrupt (F01's
++ *                   control 1 = 0x7f, as the Android driver enables it), and touches served
++ *                   into /dev/redwood-touch until the run ends, the interrupt line looked at
++ *                   every few milliseconds.
++ *   s3320_slow=1    8 s between the bring-up steps (runs 38-43 died to the hardware faster
++ *                   than the host could read the log; the gaps let the host fetch every step
++ *                   and name the killer).
++ *
++ * Touches: F12's data register 15 (its data base + 11, the Android driver's hardcode for this
++ * chip) is a 16-bit "object attention" mask; a bit set means a touch record for that finger
++ * number is waiting. The records follow, 8 bytes each from F12's data register 0: status (two
++ * bits: 0 = nothing, 1 = finger), x and y as 12-bit numbers (a low byte then a low nibble),
++ * and weight. Serving a touch is: attention mask read, then that many records, each posted
++ * into /dev/redwood-touch.
++ */
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <sys/redwood_input.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t thread_terminate(thread_t thread);
++extern void loader_log_putc(char c);
++
++static uint32_t level;
++static bool leaving;
++static unsigned slow;
++
++/* every line to the loader's log as well (and to the console when that may be written) */
++static int say(const char *format, ...) __printflike(1, 2);
++
++static int
++say(const char *format, ...)
++{
++	char line[300];
++	va_list list;
++	int length;
++
++	va_start(list, format);
++	length = vsnprintf(line, sizeof(line), format, list);
++	va_end(list);
++	for (const char *c = line; *c != 0; c++) {
++		loader_log_putc(*c);
++	}
++	if (!leaving && ml_get_interrupts_enabled()) {
++		printf("%s", line);
++	}
++	return length;
++}
++
++static inline uint32_t
++rd(vm_offset_t address)
++{
++	return *(volatile uint32_t *)address;
++}
++
++static inline void
++wr(vm_offset_t address, uint32_t value)
++{
++	*(volatile uint32_t *)address = value;
++}
++
++static void
++spin_us(uint32_t us)
++{
++	uint64_t until;
++
++	nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &until);
++	until += mach_absolute_time();
++	while (mach_absolute_time() < until) {
++	}
++}
++
++static void
++wait_ms(uint32_t ms)
++{
++	if (leaving) {
++		spin_us(ms * 1000);
++	} else {
++		delay_for_interval(ms, NSEC_PER_MSEC);
++	}
++}
++
++/* one step of the bring-up, 8 s apart in slow mode so the host can read a dying run's log */
++static void
++step(const char *what)
++{
++	if (!slow) {
++		return;
++	}
++	say("s3320: -- step %s done, sleeping 8 s --\n", what);
++	wait_ms(8000);
++}
++
++/* ---- the PMIC's SPMI bus ------------------------------------------------------------------------ */
++
++/*
++ * The 2.8 V supply of the chip: LDO 28 of the PM8998, switched on through RPMh, the way every
++ * driver on this phone does it. The way to the RPMh address of the LDO goes through the command
++ * database, and the way to the command database goes through a scratch register: the device
++ * tree's node is "qcom,cmd-db@861e0000" but its reg says <0xc3f000c 0x08> -- the unit address is
++ * convention, the register at 0xc3f000c holds the address the database lives at (that is how the
++ * phone's own kernel finds it, drivers/soc/qcom/cmd_db.c). The first version mapped 0x861e0000
++ * and read zeroes, of course (the run of Oct 25, 02:01), and went looking for the LDO over the
++ * SPMI bus instead -- where a misidentified peripheral 0x5b took the machine down when written
++ * (02:13; 0x5b is a clock divider, the device tree says so at "qcom,clkdiv@5b00"). With the
++ * database in hand none of that is needed: the LDO is asked for by name, "ldoa28" (the 'a' is
++ * the PM8998), and told 3008 mV (the device tree's avdd-voltage, min = max), HPM, on -- voltage
++ * first, then the mode, then the enable, one
++ * command per trigger (see rpmh_write), the way Android's own kernel does it.
++ */
++#define CMD_DB_SCRATCH_PHYS     0x0c3f000cUL    /* holds the address of the command database */
++#define CMD_DB_SIZE             0x20000UL
++
++/* ---- pins ------------------------------------------------------------------------------------------ */
++
++/*
++ * The sdm845's TLMM is the "v2" kind (the device tree's compatible says so): its pins do NOT
++ * live at base + 0x1000 * n. The chip has two tiles inside the pinctrl window (0x3400000,
++ * 12 MB), and a pin's registers sit at tile_base + 0x1000 * n with the pin's GLOBAL number
++ * (OnePlus's pinctrl-sdm845.c: NORTH = 0x500000, SOUTH = 0x900000, REG_SIZE = 0x1000).
++ * South holds 12-26, 35-37, 40-44, 85-96; north the rest.
++ *
++ * Runs 29-37 poked base + 0x1000 * n instead: that region before the tiles has no pins, reads
++ * came back 0 and writes vanished (run37's "writes do not stick"). Worse, its HEAD -- the first
++ * pages at 0x3400000 -- is XPU-guarded: every run that read it (runs 38-42, at tile+0x0 or
++ * window+0x0) reset the phone to EDL within seconds, while reads and writes deeper in (pin
++ * offsets from 0x31000 up, where run37 lived for 100 s) are harmless no-ops. The south tile's
++ * own head (0x3d00000, before gpio12 at +0xc000) kills the same way.
++ */
++#define TLMM_PHYS               0x03400000UL
++#define TLMM_NORTH_PHYS         (TLMM_PHYS + 0x500000UL)
++#define TLMM_SOUTH_PHYS         (TLMM_PHYS + 0x900000UL)
++#define TLMM_EAST_PHYS          (TLMM_PHYS + 0x100000UL)
++#define TLMM_NORTH_SIZE         0x100000UL      /* north's highest pin is 149: 0x95000 in */
++#define TLMM_SOUTH_SIZE         0x80000UL       /* south's highest pin is 96: 0x60000 in */
++#define TLMM_EAST_SIZE          0x80000UL
++
++static vm_offset_t tlmm_north, tlmm_south, tlmm_east;
++
++/*
++ * Which tile a global pin number lives on, from upstream pinctrl-sdm845.c (the
++ * offsets keep the GLOBAL id, so tile_base + 0x1000 * pin is right inside a
++ * tile: gpio89 = 0x3d59000, gpio88 = 0x3558000). Getting 88/125's tile wrong
++ * targets a hole, and hole WRITES reset the phone instantly (runs 44-45, pokes
++ * S/T -- five bricks to find this).
++ */
++static bool
++on_south_tile(unsigned pin)
++{
++	return (pin >= 12 && pin <= 26) || (pin >= 35 && pin <= 37) ||
++	       pin == 40 || (pin >= 89 && pin <= 96);
++}
++
++static bool
++on_east_tile(unsigned pin)
++{
++	return (pin >= 41 && pin <= 44) || (pin >= 85 && pin <= 88) || pin == 125;
++}
++
++#define GPIO_CFG(n)             ((on_south_tile(n) ? tlmm_south : on_east_tile(n) ? tlmm_east : tlmm_north) + 0x1000UL * (n))
++                                                        /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
++#define GPIO_IO(n)              (GPIO_CFG(n) + 4)       /* bit 0 in, bit 1 out */
++#define CFG_PULL_UP             3
++#define CFG_OUTPUT              (1u << 9)
++
++#define PIN_SDA                 49      /* the serial engine's first pin is the data line, the second the clock */
++#define PIN_SCL                 50
++#define PIN_RESET               99
++#define PIN_VIO                 88      /* the load switch of the 1.8 V supply */
++#define PIN_INT                 125
++
++static void
++show_pins(void)
++{
++	static const struct {
++		unsigned pin;
++		const char *what;
++	} pins[] = {
++		{ PIN_SDA, "I2C data" }, { PIN_SCL, "I2C clock" }, { PIN_RESET, "reset" },
++		{ PIN_VIO, "1.8 V switch" }, { PIN_INT, "interrupt" }
++	};
++
++	for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
++		uint32_t cfg = rd(GPIO_CFG(pins[i].pin)), io = rd(GPIO_IO(pins[i].pin));
++
++		say("s3320: gpio%u (%s): function %u, pull %u, %u mA, %s, reads %u\n", pins[i].pin, pins[i].what, (cfg >> 2) & 15,
++		    cfg & 3, (((cfg >> 6) & 7) + 1) * 2, (cfg & CFG_OUTPUT) ? (io & 2 ? "drives high" : "drives low") : "input", io & 1);
++	}
++}
++
++/* a pin to the GPIO function as an input with a pull-up, or driving `high' (2 mA, no pull) */
++static void
++take(unsigned pin, bool output_high)
++{
++	if (output_high) {
++		wr(GPIO_IO(pin), 2);
++		wr(GPIO_CFG(pin), CFG_OUTPUT);
++	} else {
++		wr(GPIO_CFG(pin), CFG_PULL_UP);
++	}
++}
++
++static bool
++level_of(unsigned pin)
++{
++	return rd(GPIO_IO(pin)) & 1;
++}
++
++/*
++ * Run44 was the first XNU run ever to write a REAL TLMM register (every run before wrote the
++ * pinless region before the tiles), and the phone reset on that write -- reads of the same
++ * registers are fine, and Android writes them constantly. So the writes get their own slow
++ * steps, one pin at a time: an unclaimed pin first, then a south-tile pin, and only then the
++ * 1.8 V switch, 8 s apart, so the log names the write that was the phone's last.
++ */
++static void
++tlmm_write_test(unsigned pin)
++{
++	char name[28];
++	uint32_t cfg0 = rd(GPIO_CFG(pin)), io0 = rd(GPIO_IO(pin)), back;
++
++	snprintf(name, sizeof(name), "write_gpio%u", pin);
++	say("s3320: write test gpio%u: cfg was %#x io was %#x, writing 0x200\n", pin, cfg0, io0);
++	wr(GPIO_IO(pin), 2);
++	wr(GPIO_CFG(pin), CFG_OUTPUT);
++	spin_us(10);
++	back = rd(GPIO_CFG(pin));
++	wr(GPIO_IO(pin), io0 & 2);
++	wr(GPIO_CFG(pin), cfg0);
++	say("s3320: write test gpio%u: read back %#x, restored (%s)\n", pin, back,
++	    back == CFG_OUTPUT ? "WRITE LANDED" : "WRITE DID NOT LAND");
++	step(name);
++}
++
++/* ---- I2C by hand (as in redwood_haptic.c) ----------------------------------------------------------- */
++
++static void
++half_bit(void)
++{
++	spin_us(5);                     /* 100 kHz at most */
++}
++
++static void
++line(unsigned pin, bool high)
++{
++	wr(GPIO_IO(pin), 0);
++	wr(GPIO_CFG(pin), CFG_PULL_UP | (high ? 0 : CFG_OUTPUT));
++}
++
++static void
++i2c_start(void)
++{
++	line(PIN_SDA, true);
++	line(PIN_SCL, true);
++	half_bit();
++	line(PIN_SDA, false);
++	half_bit();
++	line(PIN_SCL, false);
++	half_bit();
++}
++
++static void
++i2c_stop(void)
++{
++	line(PIN_SDA, false);
++	half_bit();
++	line(PIN_SCL, true);
++	half_bit();
++	line(PIN_SDA, true);
++	half_bit();
++}
++
++static bool
++i2c_bit(bool out)
++{
++	bool in;
++
++	line(PIN_SDA, out);
++	half_bit();
++	line(PIN_SCL, true);
++	for (unsigned stretched = 0; !level_of(PIN_SCL) && stretched < 100; stretched++) {
++		half_bit();
++	}
++	half_bit();
++	in = level_of(PIN_SDA);
++	line(PIN_SCL, false);
++	return in;
++}
++
++static bool
++i2c_write(uint8_t byte)
++{
++	for (int bit = 7; bit >= 0; bit--) {
++		i2c_bit((byte >> bit) & 1);
++	}
++	return !i2c_bit(true);
++}
++
++static uint8_t
++i2c_read(bool more)
++{
++	uint8_t byte = 0;
++
++	for (int bit = 7; bit >= 0; bit--) {
++		byte = (uint8_t)(byte << 1 | i2c_bit(true));
++	}
++	i2c_bit(!more);
++	return byte;
++}
++
++#define TS_ADDRESS              0x20
++
++static uint32_t taken_cfg[2], taken_io[2];
++
++static bool
++bus_take(void)
++{
++	taken_cfg[0] = rd(GPIO_CFG(PIN_SDA));
++	taken_cfg[1] = rd(GPIO_CFG(PIN_SCL));
++	taken_io[0] = rd(GPIO_IO(PIN_SDA));
++	taken_io[1] = rd(GPIO_IO(PIN_SCL));
++	line(PIN_SDA, true);
++	line(PIN_SCL, true);
++	half_bit();
++	if (!level_of(PIN_SDA) || !level_of(PIN_SCL)) {
++		wr(GPIO_IO(PIN_SDA), taken_io[0] & 2);
++		wr(GPIO_IO(PIN_SCL), taken_io[1] & 2);
++		wr(GPIO_CFG(PIN_SDA), taken_cfg[0]);
++		wr(GPIO_CFG(PIN_SCL), taken_cfg[1]);
++		say("s3320: the I2C bus is not at rest (gpio%u reads %u, gpio%u reads %u): not touched\n", PIN_SDA,
++		    level_of(PIN_SDA), PIN_SCL, level_of(PIN_SCL));
++		return false;
++	}
++	return true;
++}
++
++static void
++bus_give_back(void)
++{
++	wr(GPIO_IO(PIN_SDA), taken_io[0] & 2);
++	wr(GPIO_IO(PIN_SCL), taken_io[1] & 2);
++	wr(GPIO_CFG(PIN_SDA), taken_cfg[0]);
++	wr(GPIO_CFG(PIN_SCL), taken_cfg[1]);
++}
++
++/* `count' 8-bit registers from `reg' on (the chip's addresses count up through the page) */
++static bool
++regs_read(uint8_t reg, uint8_t *values, unsigned count)
++{
++	bool answered;
++
++	if (!bus_take()) {
++		return false;
++	}
++	i2c_start();
++	answered = i2c_write(TS_ADDRESS << 1) && i2c_write(reg);
++	if (answered) {
++		i2c_start();
++		answered = i2c_write(TS_ADDRESS << 1 | 1);
++	}
++	for (unsigned i = 0; answered && i < count; i++) {
++		values[i] = i2c_read(i + 1 < count);
++	}
++	i2c_stop();
++	bus_give_back();
++	return answered;
++}
++
++static bool
++regs_write(uint8_t reg, const uint8_t *values, unsigned count)
++{
++	bool answered;
++
++	if (!bus_take()) {
++		return false;
++	}
++	i2c_start();
++	answered = i2c_write(TS_ADDRESS << 1) && i2c_write(reg);
++	for (unsigned i = 0; answered && i < count; i++) {
++		answered = i2c_write(values[i]);
++	}
++	i2c_stop();
++	bus_give_back();
++	return answered;
++}
++
++/* ---- the supplies (RPMh, as in redwood_goodix.c) ---------------------------------------------------- */
++
++#define RSC_PHYS                0x179e0000UL    /* the application processor's "DRV 2" of the RSC at 0x179c0000 */
++#define RSC_SIZE                0x10000UL
++#define TCS(reg)                (rsc + 0xd00 + (reg))           /* command slot set 0, an "active" one */
++#define TCS_IRQ_ENABLE          0x00
++#define TCS_IRQ_STATUS          0x04
++#define TCS_IRQ_CLEAR           0x08
++#define TCS_WAIT_FOR_COMPLETION 0x10
++#define TCS_CONTROL             0x14
++#define TCS_CONTROL_ENABLE      (1u << 16)
++#define TCS_CONTROL_TRIGGER     (1u << 24)
++#define TCS_STATUS              0x18            /* 0 while busy */
++#define TCS_CMD_ENABLE          0x1c
++#define TCS_CMD_MSGID(n)        (0x30 + 20 * (n))
++#define TCS_CMD_ADDR(n)         (0x34 + 20 * (n))
++#define TCS_CMD_DATA(n)         (0x38 + 20 * (n))
++#define MSGID_WRITE_4_BYTES     0x10008
++#define MSGID_RESPONSE          0x100
++
++#define VRM_VOLTAGE             0               /* a regulator's registers, from its address: millivolts */
++#define VRM_ENABLE              4
++#define VRM_MODE                8
++#define VRM_MODE_LDO_HPM        3               /* the mainline rpmh regulator driver's "high power mode" */
++
++struct cmd_db_slave {
++	uint16_t id, header_offset, data_offset, count, version, reserved[3];
++};
++struct cmd_db_header {
++	uint32_t version;
++	uint8_t magic[4];
++	struct cmd_db_slave slave[8];
++	uint32_t checksum, reserved;
++	uint8_t data[];
++};
++struct cmd_db_entry {
++	char id[8];
++	uint32_t priority[2];
++	uint32_t address;
++	uint16_t length, offset;
++};
++
++static vm_offset_t rsc, cmd_db;
++
++/* The RPMh address of a resource by its name in the command database the boot loader left; 0 = none. */
++static uint32_t
++rpmh_address(const char *name)
++{
++	const struct cmd_db_header *db = (const struct cmd_db_header *)cmd_db;
++	char id[8] = { 0 };
++
++	if (db->magic[0] != 0xdb || db->magic[1] != 0x30 || db->magic[2] != 0x03 || db->magic[3] != 0x0c) {
++		say("s3320: no command database (magic %02x %02x %02x %02x)\n", db->magic[0], db->magic[1], db->magic[2],
++		    db->magic[3]);
++		return 0;
++	}
++	strlcpy(id, name, sizeof(id));
++	for (unsigned s = 0; s < 8; s++) {
++		const struct cmd_db_slave *slave = &db->slave[s];
++		const struct cmd_db_entry *entry = (const struct cmd_db_entry *)(db->data + slave->header_offset);
++
++		if (slave->id == 0 || slave->header_offset >= CMD_DB_SIZE - 0x1000 || slave->count > 512) {
++			continue;
++		}
++		for (unsigned i = 0; i < slave->count; i++) {
++			if (memcmp(entry[i].id, id, sizeof(id)) == 0) {
++				return entry[i].address;
++			}
++		}
++	}
++	return 0;
++}
++
++static bool
++rpmh_wait(uint32_t reg, uint32_t mask, uint32_t value, const char *what)
++{
++	for (int i = 0; i < 2000; i++) {
++		if ((rd(TCS(reg)) & mask) == value) {
++			return true;
++		}
++		spin_us(100);
++	}
++	say("s3320: RPMh: timeout waiting for %s (register %#x = %#x)\n", what, reg, rd(TCS(reg)));
++	return false;
++}
++
++/*
++ * Send ONE register write to RPMh and wait until it is done -- one command per trigger, slot 0.
++ * The phone's own kernel learns how many commands a TCS holds (its "ncpt") from the hardware;
++ * this device tree does not say it, and a request wider than the TCS's slots would write its
++ * extra commands into what is behind them. Slot 0 exists for every ncpt, so one command at a
++ * time cannot overflow anything. (Never exercised on this phone: the runs that seemed to show
++ * the machine reset through RPMh had in fact started the POCO's Goodix driver next to this one
++ * -- see avdd_on -- and it was writing sm8350 registers on an sdm845. Kept out of the way until
++ * the rest works, then tried on its own with touchscreen_rpmh=1.)
++ */
++static bool
++rpmh_write(uint32_t address, uint32_t data, const char *what)
++{
++	uint32_t irq_enable = rd(TCS(TCS_IRQ_ENABLE));
++	bool done;
++
++	for (int i = 0; rd(TCS(TCS_STATUS)) == 0; i++) {
++		if (i > 2000) {
++			say("s3320: RPMh: the command slots stay busy\n");
++			return false;
++		}
++		spin_us(100);
++	}
++	wr(TCS(TCS_CONTROL), rd(TCS(TCS_CONTROL)) & ~TCS_CONTROL_TRIGGER);
++	wr(TCS(TCS_CONTROL), rd(TCS(TCS_CONTROL)) & ~TCS_CONTROL_ENABLE);
++	wr(TCS(TCS_IRQ_CLEAR), 1);
++	wr(TCS(TCS_CMD_MSGID(0)), MSGID_WRITE_4_BYTES | MSGID_RESPONSE);
++	wr(TCS(TCS_CMD_ADDR(0)), address);
++	wr(TCS(TCS_CMD_DATA(0)), data);
++	wr(TCS(TCS_WAIT_FOR_COMPLETION), 1);
++	wr(TCS(TCS_CMD_ENABLE), 1);
++	wr(TCS(TCS_IRQ_ENABLE), irq_enable | 1);        /* the status bit follows the enable; the interrupt itself stays masked */
++	wr(TCS(TCS_CONTROL), TCS_CONTROL_ENABLE);
++	wr(TCS(TCS_CONTROL), TCS_CONTROL_ENABLE | TCS_CONTROL_TRIGGER);
++
++	done = rpmh_wait(TCS_IRQ_STATUS, 1, 1, what);
++	wr(TCS(TCS_CONTROL), rd(TCS(TCS_CONTROL)) & ~TCS_CONTROL_TRIGGER);
++	wr(TCS(TCS_CONTROL), rd(TCS(TCS_CONTROL)) & ~TCS_CONTROL_ENABLE);
++	wr(TCS(TCS_CMD_ENABLE), 0);
++	wr(TCS(TCS_WAIT_FOR_COMPLETION), 0);
++	wr(TCS(TCS_IRQ_CLEAR), 1);
++	wr(TCS(TCS_IRQ_ENABLE), irq_enable);
++	return done;
++}
++
++/*
++ * The screen's 2.8 V supply: LDO 28 of the PM8998, run at 3.008 V as the touch node's
++ * avdd-voltage has it (min = max = 0x2de600 µV; the regulator node's init-voltage, 2.856 V,
++ * is only the boot default). In the
++ * command database the resource is called "ldoa28" (the device tree's qcom,resource-name; the
++ * 'a' is the PM8998), with "ldo28" asked for too in case another firmware spells it shorter.
++ * The three register writes go out one at a time (see rpmh_write): the voltage, then the mode,
++ * then the enable last, so that the supply only comes up once the voltage and the mode are set.
++ *
++ * The database is found through the scratch register the device tree points at (see the comment
++ * above CMD_DB_SCRATCH_PHYS); skipped only with touchscreen_rpmh=0.
++ */
++static bool
++avdd_on(void)
++{
++	uint32_t base, db_base;
++	uint32_t skip_rpmh = 0;
++	vm_offset_t scratch;
++
++	if (PE_parse_boot_argn("touchscreen_rpmh", &skip_rpmh, sizeof(skip_rpmh)) && skip_rpmh == 0) {
++		say("s3320: the 2.8 V supply (ldoa28) NOT asked for (touchscreen_rpmh=0)\n");
++		return false;
++	}
++	/* the scratch register tells where the database is (an address, not a register value) */
++	scratch = ml_io_map(CMD_DB_SCRATCH_PHYS & ~0xFFFUL, 0x1000);
++	db_base = rd(scratch + (CMD_DB_SCRATCH_PHYS & 0xfff));
++	say("s3320: the command database is at %#x (from the scratch at %#x)\n", db_base, CMD_DB_SCRATCH_PHYS);
++	cmd_db = ml_io_map_wcomb(db_base & ~0xFFFUL, CMD_DB_SIZE + (db_base & 0xfff));
++	base = rpmh_address("ldoa28");
++
++	if (base == 0) {
++		base = rpmh_address("ldo28");
++	}
++	/* addresses of regulators ("VRM") have 4 in bits 19:16; anything else is not what we are looking for */
++	if (base == 0 || (base >> 16 & 0xf) != 4) {
++		say("s3320: RPMh: no regulator \"ldoa28\" (address %#x)\n", base);
++		return false;
++	}
++	say("s3320: RPMh: ldoa28 is at %#x; slot status %#x, control %#x (ncpt is in here somewhere), irq enable %#x status %#x\n",
++	    base, rd(TCS(TCS_STATUS)), rd(TCS(TCS_CONTROL)), rd(TCS(TCS_IRQ_ENABLE)), rd(TCS(TCS_IRQ_STATUS)));
++	if (!rpmh_write(base + VRM_VOLTAGE, 3008, "the voltage")) {
++		return false;
++	}
++	if (!rpmh_write(base + VRM_MODE, VRM_MODE_LDO_HPM, "the mode")) {
++		return false;
++	}
++	if (!rpmh_write(base + VRM_ENABLE, 1, "the enable")) {
++		return false;
++	}
++	say("s3320: the 2.8 V supply is on (ldoa28, 3.008 V, HPM)\n");
++	return true;
++}
++
++/* The 1.8 V supply from its load switch (GPIO 88, high = on, as the device tree has it). */
++static void
++vio_on(void)
++{
++	wr(GPIO_IO(PIN_VIO), 2);
++	wr(GPIO_CFG(PIN_VIO), CFG_OUTPUT);
++	say("s3320: the 1.8 V supply is on (gpio%u high)\n", PIN_VIO);
++}
++
++/* Diagnostic: can this pin be driven at all? Drives high then low and reads each back. */
++static void
++pin_echo_test(unsigned pin)
++{
++	uint32_t cfg = rd(GPIO_CFG(pin)), io = rd(GPIO_IO(pin));
++	bool hi, lo;
++
++	wr(GPIO_IO(pin), 2);
++	wr(GPIO_CFG(pin), CFG_OUTPUT);
++	spin_us(10);
++	hi = level_of(pin);
++	wr(GPIO_IO(pin), 0);
++	spin_us(10);
++	lo = level_of(pin);
++	wr(GPIO_IO(pin), io & 2);
++	wr(GPIO_CFG(pin), cfg);
++	say("s3320: gpio%u echo: drove high reads %u, drove low reads %u%s\n", pin, hi, lo,
++	    hi && !lo ? " (pin is ours)" : !hi && !lo ? " (HELD LOW from outside)" : "");
++}
++
++/*
++ * Is the v2 mapping real at all? A look at real pins, one per tile: gpio0 lives on the north
++ * tile at +0x0, gpio12 opens the south tile at +0xc000. NOTHING ELSE -- runs 38-42 taught why:
++ * the head of the pinctrl window (0x3400000) and the head of the south tile are holes with no
++ * pins, and reading them resets the phone (every probe that read a tile head dropped it to EDL
++ * within seconds, while the same kernels read and write the pin registers happily).
++ */
++static void
++tlmm_probe(void)
++{
++	say("s3320: tlmm north gpio0: cfg %08x io %08x, intr cfg/status %08x %08x\n", rd(tlmm_north), rd(tlmm_north + 4),
++	    rd(tlmm_north + 8), rd(tlmm_north + 12));
++	say("s3320: tlmm south gpio12: cfg %08x io %08x, intr cfg/status %08x %08x\n", rd(tlmm_south + 0xc000),
++	    rd(tlmm_south + 0xc004), rd(tlmm_south + 0xc008), rd(tlmm_south + 0xc00c));
++}
++
++/* The reset pin as an output of the GPIO function (2 mA, no pull, as Android has it) */
++static void
++reset_pin(bool high)
++{
++	wr(GPIO_IO(PIN_RESET), high ? 2 : 0);
++	wr(GPIO_CFG(PIN_RESET), CFG_OUTPUT);
++}
++
++/* ---- the chip -------------------------------------------------------------------------------------- */
++
++#define PAGE_SELECT             0xff
++#define PAGE_ZERO               0x00
++
++/*
++ * A page description table entry, 6 registers: the addresses of the function's registers and
++ * its number. The table is walked from register 0xe9 downwards, 6 at a time.
++ */
++struct rmi_fn {
++	uint8_t number, sources, version;
++	uint8_t query, command, control, data;
++};
++#define PDT_LAST                0xe9
++#define PDT_STEP                6
++#define PDT_BOTTOM              0x05
++
++/* the functions this phone's chip has (the mainline driver's list for it, plus 0x51 "custom") */
++static const uint8_t known_fn[] = { 0x01, 0x03, 0x11, 0x12, 0x30, 0x34, 0x3a, 0x51, 0x54, 0x55 };
++
++static struct rmi_fn f01, f12;
++static uint16_t attention_reg;          /* F12's data register 15: the object attention mask */
++
++static bool
++chip_select_page(uint8_t page)
++{
++	return regs_write(PAGE_SELECT, &page, 1);
++}
++
++/* The page 0 table, and with it F01 and F12. Every entry's number is known, or the entry is skipped. */
++static bool
++scan_pdt(void)
++{
++	uint8_t e[PDT_STEP], seen[0x56 / 8 + 1] = { 0 };
++	unsigned at;
++
++	if (!chip_select_page(PAGE_ZERO)) {
++		return false;
++	}
++	for (at = PDT_LAST; at >= PDT_BOTTOM && at <= 0xff - PDT_STEP; at -= PDT_STEP) {
++		if (!regs_read((uint8_t)at, e, PDT_STEP)) {
++			say("s3320: the table ends at %#04x: NOT READ\n", at);
++			return false;
++		}
++		if (e[5] == 0x00 || e[5] == 0xff) {
++			break;                  /* the table's end */
++		}
++		bool known = false;
++		for (unsigned i = 0; i < sizeof(known_fn); i++) {
++			if (known_fn[i] == e[5]) {
++				known = true;
++				break;
++			}
++		}
++		if (known && (seen[e[5] >> 3] & 1 << (e[5] & 7))) {
++			known = false;          /* a duplicate of a function already seen */
++		}
++		if (!known) {
++			continue;
++		}
++		seen[e[5] >> 3] |= (uint8_t)(1 << (e[5] & 7));
++		say("s3320:   function %#04x v%u at %#04x: query %#04x, command %#04x, control %#04x, data %#04x, %u source(s)\n",
++		    e[5], (e[4] >> 5) & 3, at, e[0], e[1], e[2], e[3], e[4] & 7);
++		switch (e[5]) {
++		case 0x01:
++			f01 = (struct rmi_fn){ .number = e[5], .sources = (uint8_t)(e[4] & 7), .version = (uint8_t)((e[4] >> 5) & 3),
++			    .query = e[0], .command = e[1], .control = e[2], .data = e[3] };
++			break;
++		case 0x12:
++			f12 = (struct rmi_fn){ .number = e[5], .sources = (uint8_t)(e[4] & 7), .version = (uint8_t)((e[4] >> 5) & 3),
++			    .query = e[0], .command = e[1], .control = e[2], .data = e[3] };
++			attention_reg = (uint16_t)(e[3] + 11);  /* data register 15 (the Android driver's hardcode) */
++			break;
++		}
++	}
++	return f01.number == 0x01;
++}
++
++/* The chip's product id ("S3706B"), 10 characters at F01's query register 11. */
++static bool
++product_id(char *id)
++{
++	if (f01.number != 0x01 || !chip_select_page(PAGE_ZERO)) {
++		return false;
++	}
++	if (!regs_read((uint8_t)(f01.query + 11), (uint8_t *)id, 10)) {
++		return false;
++	}
++	id[10] = 0;
++	return true;
++}
++
++/* ---- touchscreen=3: touches ------------------------------------------------------------------------ */
++
++#define POLL_MS                 4
++#define MAX_FINGERS             10
++#define FINGER_STATUS_MASK      0x03
++
++static uint64_t reports, touches;
++static bool finger_down[MAX_FINGERS];
++static uint16_t max_x = 1079, max_y = 2279;     /* the glass: the OP6's 1080 x 2280 panel */
++
++/* how many bits a 16-bit mask has set (the attention mask says which fingers have records) */
++static unsigned
++popcount16(uint16_t mask)
++{
++	unsigned n;
++
++	for (n = 0; mask != 0; mask >>= 1) {
++		n += mask & 1;
++	}
++	return n;
++}
++
++/*
++ * F12's data registers: the object attention mask, then the records of the fingers it names,
++ * 8 bytes each, packed one after the other. The records are served as fingers 0, 1, ... in
++ * their order (as the Android driver serves them); a finger that was down and has no record
++ * now has lifted.
++ */
++static void
++serve_touches(void)
++{
++	uint8_t a[2], r[MAX_FINGERS * 8];
++	unsigned count;
++	uint16_t attention;
++	bool seen[MAX_FINGERS] = { 0 };
++
++	if (!chip_select_page(PAGE_ZERO)) {
++		return;
++	}
++	if (!regs_read((uint8_t)attention_reg, a, 2)) {
++		return;
++	}
++	attention = (uint16_t)(a[0] | a[1] << 8);
++	count = popcount16(attention);
++	if (count > MAX_FINGERS) {
++		count = MAX_FINGERS;
++	}
++	if (count != 0 && !regs_read(f12.data, r, (uint8_t)(count * 8))) {
++		return;
++	}
++	reports++;
++	for (unsigned i = 0; i < count; i++) {
++		const uint8_t *o = &r[i * 8];
++		uint32_t status = o[0] & FINGER_STATUS_MASK, x = (uint32_t)(o[1] | (o[2] & 0xf) << 8),
++		    y = (uint32_t)(o[3] | (o[4] & 0xf) << 8);
++
++		if (status != 0) {
++			touches++;
++			redwood_touch_post(!finger_down[i] ? REDWOOD_TOUCH_DOWN : REDWOOD_TOUCH_MOVE, i,
++			    x * 65535 / max_x, y * 65535 / max_y);
++			finger_down[i] = true;
++			seen[i] = true;
++		}
++	}
++	for (unsigned i = 0; i < MAX_FINGERS; i++) {
++		if (finger_down[i] && !seen[i]) {
++			redwood_touch_post(REDWOOD_TOUCH_UP, i, 0, 0);
++			finger_down[i] = false;
++		}
++	}
++}
++
++/* ---- page-table walk: what does the mapping REALLY say (runs 44-47) ---------------- */
++
++extern vm_offset_t phystokv(vm_offset_t pa);
++
++/*
++ * The loader identity-writes the same TLMM registers and the phone lives (run47: poke N
++ * "WRITE LANDED", readback 0x200); through XNU's mapping the reads are garbage and the
++ * writes kill. So the question is what XNU's page tables actually hold for the VAs
++ * ml_io_map handed out. 16K granule, four levels: offset [13:0], PTE index [24:14],
++ * PMD index [35:25], PUD index [46:36], PGD index [47] (the kernel lives at high VAs).
++ * Descriptors: bit 0 valid, bit 1 table/page (1) or block (0), MAIR index [4:2],
++ * AP [7:6], AF [10], XN [54].
++ */
++static void
++walk_pt(vm_offset_t va, const char *what)
++{
++	uint64_t ttbr1, d;
++	vm_offset_t t;
++
++	__asm__ volatile ("mrs %0, TTBR1_EL1" : "=r" (ttbr1));
++	t = phystokv(ttbr1 & ~0x3FFFULL) + (((va >> 47) & 1) * 8);
++	d = *(volatile uint64_t *)t;
++	say("s3320: walk %s: va=%#lx root=%#lx L0[%u]=%#llx\n", what, va, ttbr1 & ~0x3FFFULL, (unsigned)((va >> 47) & 1), d);
++	if ((d & 1) == 0) {
++		say("s3320: walk %s: L0 INVALID\n", what);
++		return;
++	}
++	t = phystokv(d & ~0x3FFFULL) + (((va >> 36) & 0x7FF) * 8);
++	d = *(volatile uint64_t *)t;
++	say("s3320: walk %s: L1[%u]=%#llx\n", what, (unsigned)((va >> 36) & 0x7FF), d);
++	if ((d & 1) == 0) {
++		say("s3320: walk %s: L1 INVALID\n", what);
++		return;
++	}
++	if ((d & 3) == 1) {
++		say("s3320: walk %s: L1 BLOCK pa=%#llx mair=%u\n", what, d & 0xFFFFFFFFF0000000ULL, (unsigned)((d >> 2) & 7));
++		return;
++	}
++	t = phystokv(d & ~0x3FFFULL) + (((va >> 25) & 0x7FF) * 8);
++	d = *(volatile uint64_t *)t;
++	say("s3320: walk %s: L2[%u]=%#llx\n", what, (unsigned)((va >> 25) & 0x7FF), d);
++	if ((d & 1) == 0) {
++		say("s3320: walk %s: L2 INVALID\n", what);
++		return;
++	}
++	if ((d & 3) == 1) {
++		say("s3320: walk %s: L2 BLOCK pa=%#llx mair=%u ap=%u\n", what, d & 0xFFFFFFFFFE000000ULL, (unsigned)((d >> 2) & 7),
++		    (unsigned)((d >> 6) & 3));
++		return;
++	}
++	t = phystokv(d & ~0x3FFFULL) + (((va >> 14) & 0x7FF) * 8);
++	d = *(volatile uint64_t *)t;
++	say("s3320: walk %s: L3[%u]=%#llx\n", what, (unsigned)((va >> 14) & 0x7FF), d);
++	if ((d & 3) != 3) {
++		say("s3320: walk %s: L3 not a page (=%u)\n", what, (unsigned)(d & 3));
++		return;
++	}
++	say("s3320: walk %s: page pa=%#llx mair=%u ap=%u af=%u xn=%u\n", what, d & ~0x3FFFULL, (unsigned)((d >> 2) & 7),
++	    (unsigned)((d >> 6) & 3), (unsigned)((d >> 10) & 1), (unsigned)((d >> 54) & 1));
++}
++
++static void
++touch_thread(__unused void *parameter, __unused wait_result_t result)
++{
++	tlmm_north = ml_io_map(TLMM_NORTH_PHYS, TLMM_NORTH_SIZE);
++	tlmm_south = ml_io_map(TLMM_SOUTH_PHYS, TLMM_SOUTH_SIZE);
++	tlmm_east = ml_io_map(TLMM_EAST_PHYS, TLMM_EAST_SIZE);
++	rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
++	say("s3320: tlmm north %#lx mapped at %#lx, south %#lx at %#lx, east %#lx at %#lx, rsc %#lx at %#lx\n", TLMM_NORTH_PHYS,
++	    tlmm_north, TLMM_SOUTH_PHYS, tlmm_south, TLMM_EAST_PHYS, tlmm_east, RSC_PHYS, rsc);
++	say("s3320: level %u: %s\n", level, level == 1 ? "a look, reading only" : level == 2 ? "the supplies on, the chip probed" :
++	    "touches served");
++	step("mapped");
++	show_pins();
++	step("show_pins");
++	walk_pt(tlmm_north + 0x31000, "north-gpio0");   /* the loader reads cfg=1 there, our reads were garbage */
++	walk_pt(tlmm_south + 0x58000, "south-gpio88");
++	if (cmd_db != 0) {
++		walk_pt(cmd_db + 0x10, "cmd-db-ctl");       /* a KNOWN-GOOD device mapping as the control */
++	}
++	say("s3320: gpio0 cfg through our mapping reads %#x (the loader reads 1)\n", rd(GPIO_CFG(0)));
++	tlmm_probe();                   /* real pins only: the tile heads are XPU-guarded (runs 38-42) */
++	step("probe");
++	/* Writes disabled for run49 (read-only): the walk diagnosis survives the run, and the
++	 * writes' fatality is already proven twice (runs 44 and 45). They come back once the
++	 * page tables say what is wrong with the mapping. */
++	if (0) {
++		tlmm_write_test(0);         /* the north tile's first real write: unclaimed pin */
++		tlmm_write_test(12);        /* the south tile's first real write: same drill */
++	}
++
++	/*
++	 * run50: the gate comes off. The "fatal south-tile write" was never electrical --
++	 * gpio88 lives on the EAST tile (0x3558000) and 0x3d58000 is a hole. The loader
++	 * proved the real address writes, survives, and brings the 1.8 V rail up (pokes
++	 * S/L: I2C lines pull high). The driver now maps the EAST tile and GPIO_CFG(88)
++	 * lands there; the power-up below runs Android's exact order.
++	 */
++
++	if (level >= 2) {
++		char id[11] = "";
++
++		/* Android's order: the 2.8 V, 10 ms, the 1.8 V, 10 ms, reset high 10 ms, low 10 ms, high, ~200 ms */
++		avdd_on();
++		step("avdd");
++		vio_on();
++		step("vio");
++		reset_pin(true);
++		wait_ms(10);
++		reset_pin(false);
++		wait_ms(10);
++		reset_pin(true);
++		take(PIN_INT, false);           /* the interrupt line: an input with a pull-up */
++		wait_ms(200);
++		show_pins();                    /* post-power: VIO/RESET should drive high, INT high if the chip's IO is alive */
++		step("powered");
++		pin_echo_test(PIN_SDA);         /* held low from outside = the chip is clamping (no power) */
++		pin_echo_test(PIN_SCL);
++		step("echo");
++		if (!scan_pdt()) {
++			say("s3320: nobody answers at %#x on the bus of gpio%u/%u with the supplies on\n", TS_ADDRESS, PIN_SDA, PIN_SCL);
++			goto out;
++		}
++		step("scan_pdt");
++		if (!product_id(id)) {
++			say("s3320: the chip answers but its product id is NOT READ\n");
++			goto out;
++		}
++		step("product_id");
++		say("s3320: the chip at %#x answers: \"%s\"\n", TS_ADDRESS, id);
++		if (f12.number != 0x12) {
++			say("s3320: no F12 in the table: this driver does not know how to read this sensor\n");
++			goto out;
++		}
++		say("s3320: F12's touch records come from %#04x, the attention mask from %#04x\n", f12.data, attention_reg);
++		if (level >= 3) {
++			uint8_t ctrl0 = 0, enables = 0x7f, junk;
++
++			/* the chip out of its sleep (F01's control 0: sleep mode 0 = normal) and interrupting (control 1 = 0x7f) */
++			if (!chip_select_page(PAGE_ZERO) || !regs_read(f01.control, &ctrl0, 1) ||
++			    !regs_write(f01.control, &(uint8_t){ (uint8_t)(ctrl0 & ~0x03) }, 1) ||
++			    !regs_write((uint8_t)(f01.control + 1), &enables, 1) ||
++			    !regs_read(f01.data + 1, &junk, 1)) {           /* the interrupt status read = cleared */
++				say("s3320: F01's controls did not take\n");
++				goto out;
++			}
++			say("s3320: F01 control 0: %#04x -> %#04x; interrupt enables 0x7f; the line is %s. THE SCREEN IS SERVED "
++			    "(/dev/redwood-touch), the line looked at every %u ms\n", ctrl0, ctrl0 & ~0x03,
++			    level_of(PIN_INT) ? "high" : "LOW", POLL_MS);
++			{
++				uint64_t last = 0;
++
++				while (!leaving) {
++					serve_touches();
++					if (reports != last && reports % 500 == 0) {
++						last = reports;
++						say("s3320: so far %u reports, %u finger positions\n", (uint32_t)reports, (uint32_t)touches);
++					}
++					wait_ms(POLL_MS);
++				}
++			}
++		}
++	} else {
++		char id[11] = "";
++
++		if (!scan_pdt()) {
++			say("s3320: nobody answers at %#x with the supplies off (as expected: out of the bootloader they are off)\n",
++			    TS_ADDRESS);
++		} else {
++			if (!product_id(id)) {
++				id[0] = '?';
++				id[1] = 0;
++			}
++			say("s3320: the chip at %#x answers even with the supplies off: \"%s\" (the bootloader left them on)\n",
++			    TS_ADDRESS, id);
++		}
++	}
++out:
++	say("s3320: done\n");
++	thread_terminate(current_thread());
++}
++
++void
++redwood_s3320_init(void)
++{
++	thread_t thread;
++
++	/* the OnePlus 6 only: told apart by its framebuffer, as the buttons are (redwood_buttons.c) */
++	if (PE_state.video.v_baseAddr != 0x9D400000) {
++		return;
++	}
++	if (!PE_parse_boot_argn("touchscreen", &level, sizeof(level)) || level == 0) {
++		return;
++	}
++	if (level > 3) {
++		level = 3;
++	}
++	PE_parse_boot_argn("s3320_slow", &slow, sizeof(slow));  /* 1 = 8 s between steps: the host
++	                                                         * reads the log of a dying run */
++	if (kernel_thread_start(touch_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
+diff --git a/xnu/files/bsd/sys/redwood_input.h b/xnu/files/bsd/sys/redwood_input.h
+index eebdcbf..dd68b44 100644
+--- a/xnu/files/bsd/sys/redwood_input.h
++++ b/xnu/files/bsd/sys/redwood_input.h
+@@ -41,6 +41,7 @@ void redwood_touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y);
+ void redwood_input_init(void);
+ void redwood_virtio_input_init(void);   /* boot-arg virtio_input=1: QEMU's virtio pointer and keyboard */
+ void redwood_goodix_init(void);         /* boot-arg touchscreen=1: the phone's Goodix or FocalTech touch screen */
++void redwood_s3320_init(void);          /* boot-arg touchscreen=N: the OnePlus 6's Synaptics S3706 (bsd/dev/redwood_s3320.c) */
+ void redwood_buttons_init(void);        /* boot-arg buttons=1: the phone's power and volume keys */
+ void redwood_ufs_init(void);           /* ufs=2 to xnuloader: the phone's storage, read only, through the loader (ufs_shared_pa=) */
+ void redwood_ufs_report(const char *when); /* where reading the storage has spent its time so far */
+diff --git a/xnu/redwood.patch b/xnu/redwood.patch
+index 5bd2dc1..b6467be 100644
+--- a/xnu/redwood.patch
++++ b/xnu/redwood.patch
+@@ -62,16 +62,17 @@ index a4d25040f38f..aad72993d139 100644
+  kern_debug.o_INCFLAGS += -I$(SRCROOT)/osfmk
+  
+ diff --git a/bsd/conf/files b/bsd/conf/files
+-index 44274016a4cf..4512e7ab8ba3 100644
++index 44274016a4cf..46321c2da582 100644
+ --- a/bsd/conf/files
+ +++ b/bsd/conf/files
+-@@ -109,6 +109,38 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
++@@ -109,6 +109,39 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+  bsd/dev/unix_startup.c			standard
+  
+  bsd/dev/monotonic.c optional monotonic
+ +bsd/dev/redwood_input.c		standard
+ +bsd/dev/redwood_virtio_input.c	standard
+ +bsd/dev/redwood_goodix.c	standard
+++bsd/dev/redwood_s3320.c		standard
+ +bsd/dev/redwood_buttons.c	standard
+ +bsd/dev/redwood_battery.c	standard
+ +bsd/dev/redwood_ufs.c	standard
+@@ -104,7 +105,7 @@ index 44274016a4cf..4512e7ab8ba3 100644
+  bsd/dev/dev_perfmon.c optional config_perfmon
+  
+  bsd/libkern/crc32.c			standard
+-@@ -155,6 +187,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
++@@ -155,6 +188,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
+  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
+  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
+@@ -119,7 +120,7 @@ index 44274016a4cf..4512e7ab8ba3 100644
+  
+  bsd/miscfs/routefs/routefs_ops.c	optional routefs
+  
+-@@ -361,6 +401,7 @@ bsd/security/audit/audit_syscalls.c		standard
++@@ -361,6 +402,7 @@ bsd/security/audit/audit_syscalls.c		standard
+  bsd/security/audit/audit_worker.c		optional config_audit
+  
+  bsd/pthread/pthread_shims.c		standard
+@@ -127,7 +128,7 @@ index 44274016a4cf..4512e7ab8ba3 100644
+  bsd/pthread/pthread_priority.c		standard
+  bsd/pthread/pthread_workqueue.c		standard
+  
+-@@ -383,6 +424,7 @@ bsd/kern/kern_debug.c			standard
++@@ -383,6 +425,7 @@ bsd/kern/kern_debug.c			standard
+  bsd/kern/kern_symfile.c			standard
+  bsd/kern/kern_descrip.c			standard
+  bsd/kern/kern_guarded.c			standard
+diff --git a/xnuloader/loader.c b/xnuloader/loader.c
+index 8e971ef..d951310 100644
+--- a/xnuloader/loader.c
++++ b/xnuloader/loader.c
+@@ -204,7 +204,7 @@ print(const char *fmt, ...)
+ 			while (*s) {
+ 				put_char(*s++);
+ 			}
+-		} else if (*fmt == 'x' || *fmt == 'd') {
++		} else if (*fmt == 'x' || *fmt == 'd' || *fmt == 'u') {
+ 			uint64_t v = __builtin_va_arg(ap, uint64_t);
+ 			unsigned base = (*fmt == 'x') ? 16 : 10;
+ 			char tmp[24];
+@@ -251,6 +251,26 @@ clean_dcache(uint64_t start, uint64_t end)
+ 	__asm__ volatile ("dsb sy");
+ }
+ 
++/* ms-scale busy wait off the always-on timer (CNTFRQ=19.2 MHz on this phone) */
++static void
++ms_delay(uint64_t ms)
++{
++	uint64_t t0 = READ_SYSREG(cntpct_el0);
++
++	while (READ_SYSREG(cntpct_el0) - t0 < ms * 19200) {
++	}
++}
++
++/* microsecond-scale busy wait, same timer */
++static void
++us_delay(uint64_t us)
++{
++	uint64_t t0 = READ_SYSREG(cntpct_el0);
++
++	while (READ_SYSREG(cntpct_el0) - t0 < us * 19) {
++	}
++}
++
+ /* ------------------------------------------------------------------------ */
+ /* Log persistence: raw write to a GPT partition (phone only)               */
+ 
+@@ -3875,6 +3895,282 @@ fb_command(char *cmd)
+ 			fb_reply("OKAY", "watchdog test: not petting any more");
+ 			for (;;) {
+ 			}
++		} else if (starts_with(cmd, "oem poke")) {
++			/*
++			 * Parameterized TLMM discriminator (runs 44/45: XNU resets on ANY real tile write,
++			 * reads fine; run46: the LOADER's writes to the same pins SURVIVED 8 s+). One letter
++			 * picks the step, the host fetches the log between steps, nobody has to die:
++			 *
++			 *   E   print the execution context: CurrentEL, HCR_EL2 (stage 2 armed?), SPSR
++			 *   R   read-only: north gpio0 + south gpio88 cfg/io
++			 *   N   write north gpio0 (io=2, cfg=0x200) and read the cfg back
++			 *   S   write south gpio88 the same way (1.8 V on) and read it back
++			 *   X   release both pins (inputs)
++			 */
++			char what = 'Q';
++			/* gpio88 (1.8V load switch) is on the EAST tile: 0x3400000 + 0x100000 + 0x1000*88.
++			 * 0x3d58000 ("south gpio88") was a HOLE -- every write there reset the phone
++			 * (runs 44-45, pokes S/T); upstream pinctrl-sdm845.c settles it. */
++			volatile uint32_t *io88 = (volatile uint32_t *)(uintptr_t)0x03558004ULL;
++			volatile uint32_t *cfg88 = (volatile uint32_t *)(uintptr_t)0x03558000ULL;
++			/*
++			 * The chip's own pins: 49/50 (I2C) and 99 (reset) are on the north tile
++			 * (0x3900000 + 0x1000 * n); 125 (the interrupt) is EAST like 88 (0x357d000).
++			 * The I2C lines' BOARD pull-ups go to the touch VDDIO rail behind the gpio88
++			 * load switch -- their LEVEL is a voltmeter on that rail.
++			 * NOTE: 0x3931000 above ("gpio0") is actually GPIO49's cfg (0x1000 * 49) -- the
++			 * old R/N pokes were mislabeled; cfg=1 there is the I2C line's pull-up input.
++			 */
++			volatile uint32_t *cfg49 = (volatile uint32_t *)(uintptr_t)0x03931000ULL;
++			volatile uint32_t *io49 = (volatile uint32_t *)(uintptr_t)0x03931004ULL;
++			volatile uint32_t *cfg50 = (volatile uint32_t *)(uintptr_t)0x03932000ULL;
++			volatile uint32_t *io50 = (volatile uint32_t *)(uintptr_t)0x03932004ULL;
++			volatile uint32_t *cfg99 = (volatile uint32_t *)(uintptr_t)0x03963000ULL;
++			volatile uint32_t *io99 = (volatile uint32_t *)(uintptr_t)0x03963004ULL;
++			volatile uint32_t *cfg125 = (volatile uint32_t *)(uintptr_t)0x0357d000ULL;
++			volatile uint32_t *io125 = (volatile uint32_t *)(uintptr_t)0x0357d004ULL;
++
++			/*
++			 * BOUNDED letter scan: the fastboot command buffer may not be NUL-terminated where
++			 * the string ends (the second poke E died scanning it -- the first died reading
++			 * HCR_EL2 at EL1). The letter, if any, sits right after "oem poke" + a space.
++			 */
++			for (int i = 8; i < 12; i++) {
++				char c = cmd[i];
++
++				if (c == 0) {
++					break;
++				}
++				if (c == 'E' || c == 'R' || c == 'N' || c == 'S' || c == 'X' || c == 'V' || c == 'L' || c == 'Q' ||
++				    c == 'T' || c == 'M' || c == 'I' || c == 'P' || c == 'W') {
++					what = c;
++					break;
++				}
++			}
++			switch (what) {
++			case 'Q':
++				print("poke Q: the poke path itself is alive\n");
++				break;
++			case 'V':
++				/* print with arguments, no system register touched: splits print from the MRS */
++				print("poke V: args work %u %s\n", (uint64_t)4711, "string-arg");
++				break;
++			case 'E':
++				/*
++				 * CurrentEL first, printed and flushed BEFORE touching any EL2 register: the
++				 * first poke E read HCR_EL2 unconditionally, the phone vanished from USB with
++				 * nothing logged -- at EL1 that MRS is trapped, and if the loader is EL1 that
++				 * was the crash (which itself is an answer: EL1's writes survive, so the S2
++				 * read-only theory is out and XNU's own stage-1 mapping is the suspect).
++				 */
++				{
++					uint64_t el = READ_SYSREG(CurrentEL) >> 2 & 3;
++
++					print("poke E: CurrentEL=EL%u%s\n", el + 1, el + 1 == 2 ? "" : " (no HCR read: would trap)");
++					if (el == 2) {
++						print("poke E: HCR_EL2=%x (stage 2 armed?)\n", READ_SYSREG(HCR_EL2));
++					}
++				}
++				break;
++			case 'R':
++				print("poke R: gpio49 cfg=%x io=%x, gpio88 cfg=%x io=%x\n", (uint64_t)*cfg49, (uint64_t)*io49,
++				    (uint64_t)*cfg88, (uint64_t)*io88);
++				print("poke R: gpio50 cfg=%x io=%x, gpio99 cfg=%x io=%x, gpio125 cfg=%x io=%x\n", (uint64_t)*cfg50,
++				    (uint64_t)*io50, (uint64_t)*cfg99, (uint64_t)*io99, (uint64_t)*cfg125, (uint64_t)*io125);
++				break;
++			case 'L':
++				/*
++				 * The VDDIO voltmeter: the board's I2C pull-ups (and the chip's output
++				 * drivers) all hang off the rail behind the gpio88 switch. gpio49/50 high =
++				 * the rail is live; gpio125 low = the chip is alive on it.
++				 */
++				print("poke L: levels: 49=%u 50=%u 99=%u 125=%u (88 cfg=%x io=%x)\n", (uint64_t)(*io49 & 1),
++				    (uint64_t)(*io50 & 1), (uint64_t)(*io99 & 1), (uint64_t)(*io125 & 1),
++				    (uint64_t)*cfg88, (uint64_t)*io88);
++				break;
++			case 'N':
++				/* NOTE: 0x3931000 is GPIO49 (the I2C SDA line), not gpio0 -- the old label was wrong */
++				print("poke N: writing GPIO49 (I2C SDA) io=2 cfg=0x200\n");
++				*io49 = 2;
++				*cfg49 = 0x200;
++				print("poke N: issued, readback cfg=%x (%s)\n", (uint64_t)*cfg49, *cfg49 == 0x200 ? "WRITE LANDED" : "DROPPED");
++				break;
++			case 'S':
++				print("poke S: writing EAST gpio88 (0x3558000) io=2 cfg=0x200 (1.8 V on)\n");
++				*io88 = 2;
++				*cfg88 = 0x200;
++				print("poke S: issued, readback cfg=%x (%s)\n", (uint64_t)*cfg88, *cfg88 == 0x200 ? "WRITE LANDED" : "DROPPED");
++				break;
++			case 'X':
++				*cfg49 = 0;
++				*cfg88 = 0;
++				print("poke X: both pins released (inputs)\n");
++				break;
++			case 'T':
++				/*
++				 * Inert write test (now against the REAL gpio88 on the EAST tile): write
++				 * cfg88's own value back and set the output latch to 0 with OE still 0 --
++				 * no electrical change anywhere. With the address fixed this should land.
++				 * Discriminates "south tile writes fault (XPU?)" from "driving gpio88
++				 * high is electrically fatal": if THIS survives, south writes work and
++				 * the S death is electrical.
++				 */
++				{
++					uint32_t c = *cfg88;
++
++					print("poke T: south inert write: cfg88=%x io88=%x\n", (uint64_t)c, (uint64_t)*io88);
++					*cfg88 = c;
++					*io88 = 0;
++					print("poke T: issued, readback cfg88=%x (%s)\n", (uint64_t)*cfg88,
++					    *cfg88 == c ? "WRITE LANDED" : "DROPPED");
++				}
++				break;
++			case 'M':
++				/*
++				 * S with instruments: drive gpio88 high and sample the voltmeter pins at
++				 * +1 ms and +5 ms. The host hammers "oem log"+"upload" in a retry loop
++				 * right after; whatever got printed before death is what we get (no UFS
++				 * flush here).
++				 */
++				print("poke M: cfg88=%x io88=%x, driving south gpio88 high\n", (uint64_t)*cfg88, (uint64_t)*io88);
++				*io88 = 2;
++				*cfg88 = 0x200;
++				ms_delay(1);
++				print("poke M: t+1ms: 49=%u 50=%u 99=%u 125=%u cfg88=%x\n", (uint64_t)(*io49 & 1),
++				    (uint64_t)(*io50 & 1), (uint64_t)(*io99 & 1), (uint64_t)(*io125 & 1), (uint64_t)*cfg88);
++				ms_delay(4);
++				print("poke M: t+5ms: 49=%u 50=%u 99=%u 125=%u cfg88=%x\n", (uint64_t)(*io49 & 1),
++				    (uint64_t)(*io50 & 1), (uint64_t)(*io99 & 1), (uint64_t)(*io125 & 1), (uint64_t)*cfg88);
++				break;
++			case 'I': {
++				/*
++				 * Chip liveness: release reset (north gpio99 -- proven-safe tile), give the
++				 * chip its boot time, then a bare I2C address probe on gpio49/50. The lines
++				 * are driven open-drain by hand (OE=1+io=0 = low, OE=0 = release); the board
++				 * pull-ups to VDDIO make a released line read 1. ACK on the address byte =
++				 * the chip is alive on a powered bus.
++				 */
++				volatile uint32_t *sda_c = cfg49, *scl_c = cfg50;
++#define POKE_I_HI(sda)  (*(sda) = 0x3)          /* input, pull-up: released */
++#define POKE_I_LO(sda)  (*(sda) = 0x200)        /* output, latch 0: driven low */
++				print("poke I: levels before: 49=%u 50=%u 99=%u 125=%u\n", (uint64_t)(*io49 & 1),
++				    (uint64_t)(*io50 & 1), (uint64_t)(*io99 & 1), (uint64_t)(*io125 & 1));
++				*io49 = 0;
++				*io50 = 0;
++				*io99 = 2;
++				*cfg99 = 0x200;
++				us_delay(5);
++				POKE_I_HI(sda_c);
++				POKE_I_HI(scl_c);
++				ms_delay(200);
++				print("poke I: after reset release: 49=%u 50=%u 125=%u\n", (uint64_t)(*io49 & 1),
++				    (uint64_t)(*io50 & 1), (uint64_t)(*io125 & 1));
++				/* START: SDA falls while SCL is high */
++				us_delay(5);
++				POKE_I_LO(sda_c);
++				us_delay(5);
++				POKE_I_LO(scl_c);
++				/* address byte 0x40 (0x20 << 1, write), MSB first */
++				for (int b = 7; b >= 0; b--) {
++					if (0x40 >> b & 1) {
++						POKE_I_HI(sda_c);
++					} else {
++						POKE_I_LO(sda_c);
++					}
++					us_delay(5);
++					POKE_I_HI(scl_c);
++					us_delay(5);
++					POKE_I_LO(scl_c);
++				}
++				/* 9th clock: release SDA, the addressed device pulls it low = ACK */
++				POKE_I_HI(sda_c);
++				us_delay(5);
++				POKE_I_HI(scl_c);
++				us_delay(5);
++				uint32_t ack = *io49 & 1;
++				POKE_I_LO(scl_c);
++				/* STOP: SDA rises while SCL high */
++				us_delay(5);
++				POKE_I_HI(scl_c);
++				us_delay(5);
++				POKE_I_HI(sda_c);
++				us_delay(5);
++				print("poke I: probe 0x20: %s (sda=%u, final 49=%u 50=%u 125=%u)\n", ack ? "NACK (no chip)" : "ACK (CHIP IS ALIVE)",
++				    (uint64_t)ack, (uint64_t)(*io49 & 1), (uint64_t)(*io50 & 1), (uint64_t)(*io125 & 1));
++				break;
++			}
++			case 'P': {
++				/*
++				 * Page-table evidence: walk TTBR0 for the south-tile write target and the
++				 * proven-safe north one. If the south descriptor says read-only (AP[1], bit
++				 * 6 of a L3 entry / L2-L1 block), every poke death is a permission fault
++				 * with no abort handler -- a mapping bug, not electrical anything.
++				 */
++				uint64_t ttbr0, tcr, desc, tbl;
++				__asm__ volatile ("mrs %0, ttbr0_el1" : "=r" (ttbr0));
++				__asm__ volatile ("mrs %0, tcr_el1" : "=r" (tcr));
++				print("poke P: ttbr0=%x tcr=%x\n", (uint64_t)ttbr0, (uint64_t)tcr);
++				tbl = ttbr0 & 0xFFFFFFFFFFFULL;
++				static const uint64_t targets[3] = { 0x03d58000ULL, 0x03931000ULL, 0x03963000ULL };
++				for (unsigned k = 0; k < 3; k++) {
++					uint64_t va = targets[k], pa = tbl;
++
++					print("poke P: va=%x\n", va);
++					for (int lv = 0; lv < 4; lv++) {
++						uint64_t idx = va >> (39 - 9 * lv) & 0x1FF;
++
++						desc = ((volatile uint64_t *)pa)[idx];
++						print("poke P: L%d[%x] @%x = %x\n", lv, idx, pa, desc);
++						if (!(desc & 1)) {
++							print("poke P: INVALID above\n");
++							break;
++						}
++						if ((desc & 3) == 1 || (lv == 3)) {
++							/* block (or L3 page): AP[1]=bit6 (0=EL1 RW, 1=EL1 RO) */
++							print("poke P: %s AP1=%x AF=%x attrs=%x  --> %s\n", lv == 3 ? "page" : "block",
++							    (unsigned)((desc >> 6) & 1), (unsigned)((desc >> 10) & 1), (unsigned)(desc & 7),
++							    (desc >> 6) & 1 ? "READ-ONLY" : "read-write");
++							break;
++						}
++						pa = desc & 0xFFFFFFFFF000ULL;
++					}
++				}
++				break;
++			}
++			case 'W': {
++				/*
++				 * The discriminator: the SAME inert south-tile write as poke T, but with the
++				 * MMU and d-cache off. Survives => the mapping was read-only (or otherwise
++				 * faulty) and the tile is writable in truth -- fix the page tables. Dies =>
++				 * an external abort from the tile itself (power domain / PDC ownership), a
++				 * hardware-state problem, not a mapping one.
++				 */
++				uint64_t sctlr;
++
++				print("poke W: south inert write with MMU OFF\n");
++				__asm__ volatile ("dsb sy");
++				__asm__ volatile ("mrs %0, sctlr_el1" : "=r" (sctlr));
++				uint64_t off = sctlr & ~((1ULL << 0) | (1ULL << 2) | (1ULL << 12));
++				__asm__ volatile ("msr sctlr_el1, %0" : : "r" (off));
++				__asm__ volatile ("isb");
++				*cfg88 = 0;
++				*io88 = 0;
++				__asm__ volatile ("isb");
++				__asm__ volatile ("msr sctlr_el1, %0" : : "r" (sctlr));
++				__asm__ volatile ("isb");
++				print("poke W: SURVIVED -- cfg88=%x io88=%x (mapping was the problem)\n", (uint64_t)*cfg88, (uint64_t)*io88);
++				break;
++			}
++			}
++			/*
++			 * No flush_log() here: it writes the logdump partition through the loader's UFS
++			 * driver, and every poke that called it took the machine down within seconds
++			 * (both poke E's, and run46's death window matches its position at the end of the
++			 * old all-in-one poke). The writes themselves never were the problem -- run46 was
++			 * alive 8 s after BOTH tile writes. The host fetches the lines with "oem log",
++			 * which only composes the staged buffer, no UFS involved.
++			 */
++			fb_reply("OKAY", "");
+ 		} else if (starts_with(cmd, "oem memmap")) {
+ 			/* the firmware's memory map into the log (then "oem log" and fetch it) */
+ 			print_memory_map();
+-- 
+2.53.0
+

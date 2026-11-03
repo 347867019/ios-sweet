@@ -1,0 +1,167 @@
+From a5e3d075bc8739966f97e809e0028a7882c1bacc Mon Sep 17 00:00:00 2001
+From: oxjmo <oxjmo@localhost>
+Date: Mon, 26 Oct 2026 15:51:59 +0000
+Subject: [PATCH 3/7] OnePlus 6 (enchilada): SMP on all seven cores
+
+cpus=8 froze within seconds of the first cross-cpu wakeup. The storm
+guard for injected SGI 0 counted on one counter shared by every
+processor, so ordinary scheduler kicks pushed it over its cap and every
+core then stopped dispatching cpu_signal_handler for SGI 0 -- the
+scheduler's own signals went nowhere and the machine locked up. The
+counters are per processor now, and only a core really being flooded
+masks the interrupt; a run with all cores brought in 1000+ such signals
+on two of them and carried on (fifteen minutes to the desktop). Each
+core now also reports its first interrupts and the time a PSCI start
+took to join, which is how the story above was read out of the log.
+---
+ xnu/files/osfmk/arm64/gic_v3_irq.c | 58 ++++++++++++++++++------------
+ xnu/files/osfmk/arm64/psci_smp.c   | 15 ++++++++
+ 2 files changed, 51 insertions(+), 22 deletions(-)
+
+diff --git a/xnu/files/osfmk/arm64/gic_v3_irq.c b/xnu/files/osfmk/arm64/gic_v3_irq.c
+index 8f5b0d0..40f4acf 100644
+--- a/xnu/files/osfmk/arm64/gic_v3_irq.c
++++ b/xnu/files/osfmk/arm64/gic_v3_irq.c
+@@ -27,6 +27,7 @@
+ #include <mach/mach_types.h>
+ #include <kern/debug.h>
+ #include <kern/simple_lock.h>
++#include <kern/misc_protos.h>
+ #include <os/atomic_private.h>
+ #include <arm/cpu_data_internal.h>
+ #include <arm/cpu_internal.h>
+@@ -94,6 +95,16 @@ static uint64_t gic_active_iar[MAX_CPUS];
+ uint64_t        gic_unhandled_count;
+ uint32_t        gic_last_unhandled;
+ 
++/*
++ * Bring-up trace, per processor: the first interrupts a core takes, and how
++ * many signals have come its way, say whether (and when) a core came alive.
++ * The counters were shared between the processors once, which hid which core
++ * the story was about.
++ */
++static unsigned gic_dbg_iar_n[MAX_CPUS];
++static unsigned gic_sgi0_n[MAX_CPUS];
++static unsigned gic_timer_n[MAX_CPUS];
++
+ /*
+  * The attached SPIs. A slot is filled before its interrupt is enabled and emptied after it has
+  * been disabled and no handler of it runs any more (busy), so the handler path reads the table
+@@ -296,6 +307,18 @@ gic_v3_spi_count(uint32_t intid)
+ 	return 0;
+ }
+ 
++extern void loader_log_line(const char *line);
++
++/* A line of the bring-up trace, with the processor it happened on. */
++static void
++gic_dbg(const char *what, int cpu, uint64_t value)
++{
++	char line[80];
++
++	snprintf(line, sizeof(line), "gic: cpu %d %s0x%llx\n", cpu, what, value);
++	loader_log_line(line);
++}
++
+ static void
+ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub, __unused int source)
+ {
+@@ -305,14 +328,9 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
+ 		uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
+ 		uint32_t intid = (uint32_t)(iar & 0xffffff);
+ 
+-		{
+-			static unsigned gic_irq_dbg_count;
+-			extern void loader_log_hex(const char *prefix, uint64_t value);
+-
+-			if (gic_irq_dbg_count < 8) {
+-				gic_irq_dbg_count++;
+-				loader_log_hex("gic: irq iar ", iar);
+-			}
++		if (gic_dbg_iar_n[cpu] < 8) {
++			gic_dbg_iar_n[cpu]++;
++			gic_dbg("iar ", cpu, iar);
+ 		}
+ 
+ 		if (intid >= GIC_INTID_SPURIOUS_MIN) {
+@@ -326,34 +344,30 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
+ 			 * hypervisor remaps it (qcom device trees route the arch timers at
+ 			 * PPI 0-3) -- on INTIDs 16-19. Same sequence as the FIQ path.
+ 			 */
+-			static unsigned tmr_dbg_count;
+-			if (tmr_dbg_count++ < 4) {
+-				extern void loader_log_hex(const char *prefix, uint64_t value);
+-
+-				loader_log_hex("gic: timer intid ", intid);
++			if (gic_timer_n[cpu]++ < 4) {
++				gic_dbg("timer intid ", cpu, intid);
+ 			}
+ 			/* same sequence as the FIQ path in sleh_fiq() */
+ 			getCpuDatap()->cpu_decrementer = -1; /* Large */
+ 			rtclock_intr(TRUE);
+ 		} else if (intid == GIC_SGI_SIGNAL) {
+-			static unsigned gic_sgi0_run;
+-			extern void loader_log_hex(const char *prefix, uint64_t value);
++			unsigned n = ++gic_sgi0_n[cpu];
+ 
+-			gic_sgi0_run++;
+-			if (gic_sgi0_run <= 4 || (gic_sgi0_run % 100) == 0) {
+-				loader_log_hex("gic: sgi0 handle #", gic_sgi0_run);
+-				loader_log_hex("gic: sgi0 sig mask ", getCpuDatap()->cpu_signal);
++			if (n <= 8 || (n % 1000) == 0) {
++				gic_dbg("sgi0 handle #", cpu, n);
++				gic_dbg("sgi0 sig mask ", cpu, getCpuDatap()->cpu_signal);
+ 			}
+ 
+-			if (gic_sgi0_run > 1000) {
++			if (n > 1000) {
+ 				/*
+ 				 * Bring-up: nothing in the kernel is signalling this much this early.
+ 				 * Something outside (hypervisor/firmware remnants) keeps injecting
+ 				 * SGI 0; left alone it starves everything else. Mask it and say so.
+ 				 */
+-				if (gic_sgi0_run == 1001) {
++				if (n == 1001) {
+ 					gic_mask(intid);
+-					loader_log_hex("gic: sgi0 storm masked, sig ", getCpuDatap()->cpu_signal);
++					gic_dbg("sgi0 storm masked at #", cpu, n);
++					gic_dbg("sgi0 storm sig ", cpu, getCpuDatap()->cpu_signal);
+ 				}
+ 			} else {
+ 				cpu_signal_handler();
+diff --git a/xnu/files/osfmk/arm64/psci_smp.c b/xnu/files/osfmk/arm64/psci_smp.c
+index 221defa..3baefaf 100644
+--- a/xnu/files/osfmk/arm64/psci_smp.c
++++ b/xnu/files/osfmk/arm64/psci_smp.c
+@@ -186,6 +186,7 @@ psci_smp_start_cpu(int cpu)
+ 	__builtin_arm_dsb(DSB_SY);
+ 
+ 	os_atomic_store(&psci_smp_cpu_stage[cpu], PSCI_SMP_CPU_ASKED, release);
++	uint64_t began = mach_absolute_time();
+ 	status = psci_call(PSCI_CPU_ON, phys_id, entry, 0);
+ 	if (status != 0) {
+ 		os_atomic_store(&psci_smp_cpu_stage[cpu], 0, release);
+@@ -199,6 +200,20 @@ psci_smp_start_cpu(int cpu)
+ 	do {
+ 		stage = os_atomic_load(&psci_smp_cpu_stage[cpu], acquire);
+ 		if (stage >= PSCI_SMP_CPU_RUNNING) {
++			/*
++			 * Say it made it (and how long the firmware and its way in took): the
++			 * kernel's own log keeps only the last of a run, and a core that never
++			 * quite arrives says so here -- one line for each is what a bring-up has to go by.
++			 */
++			extern void loader_log_line(const char *line);
++			uint64_t ns;
++			char line[96];
++
++			absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
++			snprintf(line, sizeof(line), "psci: cpu %d (MPIDR 0x%x) joined the kernel in %llu us\n",
++			    cpu, phys_id, ns / 1000);
++			printf("%s", line);
++			loader_log_line(line);
+ 			return KERN_SUCCESS;
+ 		}
+ 		/* memory, not this processor's copy of it */
+-- 
+2.53.0
+

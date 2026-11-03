@@ -1,0 +1,2522 @@
+From 7bad09f5b39ee14d1d6d0b65c151895c01672f06 Mon Sep 17 00:00:00 2001
+From: oxjmo <oxjmo@localhost>
+Date: Sat, 24 Oct 2026 23:00:56 +0000
+Subject: [PATCH 1/7] OnePlus 6 (enchilada): boot chain, rootfs, clock fix,
+ userland up
+
+Phases 5-8 of the SDM845 port, all verified on the phone:
+
+- enchilada device config and platform expert for the loader; the
+  kernel reaches launchd and the whole iOS userland (backboardd,
+  SpringBoard) runs on the phone.
+- redwood_usb.c: the DWC3 gadget / CDC-ECM stand-in, boot-arg usb=N.
+- IOFindBSDRoot rootfast=1: decide the root device from the memory-map
+  RAMDisk without IOKit matching (a real device tree keeps drivers
+  matching forever); nodisp=1 gates the display stand-in.
+- The clock bug: Qualcomm's hypervisor remaps the arch timer PPIs
+  (INTIDs 16-19, per the device tree) -- enable those and treat them
+  as timer expiry alongside the standard PPI 27.
+---
+ common/devices/enchilada.conf           |  40 ++
+ common/devices/enchilada.platform.c     |  14 +
+ xnu-build.sh                            |   1 +
+ xnu/files/bsd/dev/redwood_input.c       |   1 +
+ xnu/files/bsd/dev/redwood_usb.c         | 732 +++++++++++++++++++
+ xnu/files/bsd/sys/redwood_input.h       |   1 +
+ xnu/files/iokit/Kernel/GenericARMPE.cpp |  15 +-
+ xnu/files/osfmk/arm64/gic_v3_irq.c      |  86 ++-
+ xnu/files/osfmk/arm64/loader_return.c   |  24 +-
+ xnu/redwood.patch                       | 904 +++++++++++++++++++++++-
+ xnuloader/loader.c                      | 143 +++-
+ 11 files changed, 1913 insertions(+), 48 deletions(-)
+ create mode 100644 common/devices/enchilada.conf
+ create mode 100644 common/devices/enchilada.platform.c
+ create mode 100644 xnu/files/bsd/dev/redwood_usb.c
+
+diff --git a/common/devices/enchilada.conf b/common/devices/enchilada.conf
+new file mode 100644
+index 0000000..e4e9566
+--- /dev/null
++++ b/common/devices/enchilada.conf
+@@ -0,0 +1,40 @@
++# Device profile: sourced by common/build.sh and common/run.sh. Copy with common/new-device.sh.
++# Everything here is plain shell variables; see docs/PORTING.md for where each value comes from.
++
++NAME="OnePlus 6 (enchilada)"
++KIND=phone                      # phone | qemu
++SOC="Qualcomm Snapdragon 845 (SDM845 v2.1)"
++
++# --- boot chain (phones) ---------------------------------------------------------------------------
++# The phone boots a Mu-Silicium UEFI (Project Silicium) with `fastboot boot`; the UEFI starts our loader.
++UEFI_TARGET=enchilada
++UEFI_FD=                        # built SILICIUM_UEFI.fd with the XnuLoader hook: Mu-Silicium/Build/enchiladaPkg/...
++                                # (official v4.0 prebuilt fd, NO hook: /data/uefi/SILICIUM_UEFI.fd -- smoke test only)
++DTB=/home/oxjmo/oneplus_ios_sweet/op6/backup/op6-20261023-151102/dtb/fdt.bin
++FD_BASE=0x9FC00000              # official v4.0 BootShim.bin disasm: mov x5,#0x9fc00000 (redwood is 0x9FD00000!)
++FD_SIZE=0x300000                # official enchilada v4.0 fd is 3 MiB (redwood is 0x200000)
++PAYLOAD_BASE=0xF0000000         # where the kernel + images container goes (free RAM in the memory map)
++
++# --- kernel and loader -----------------------------------------------------------------------------
++# xnuloader/loader.c picks its `struct platform` by what the firmware reports (see docs/PORTING.md):
++# a new SoC needs one there (common/new-device.sh writes a starting point next to this file).
++FB_BASE=0x9D400000              # the GOP base the UEFI printed on first boot ("display 1080 x 2280 at 9d400000");
++                                # the DTB's cont_splash_region@9d400000, same value (2026-10-24 real device)
++WIFI_ATH11K=1                   # WCN3990, integrated on PCIe (ath11k supports it)
++
++# --- what the run needs ----------------------------------------------------------------------------
++BOOTARGS="touchscreen=1 cpufreq=1 bootcpu=7 cpus=8"   # 4x Gold + 4x Silver, all Cortex-A75 (small=0x0)
++DEFAULT_SECS=900
++USERLAND_VARS=""                # extra variables for userland/build.sh, e.g. "GL=1"
++# The phone's own firmware, taken from its Android (never in the repository): see docs/PORTING.md.
++FIRMWARE="fw-gpu fw-wifi fw-audio fw-haptic"   # from /vendor/firmware_mnt via adb
++
++# --- hardware reference (from the live FDT, capture 2026-10-23, see op6/backup/op6-20261023-151102) ---
++# panel: Samsung SOFEF00 cmd mode 1080x2280 (dsi_samsung_sofef00_m_cmd, dtbo_idx=5, panel_type=black)
++# touch: Synaptics S3320 (RMI4) on GENI I2C @0xa90000, addr 0x20, IRQ pm8998 gpio125, coords 1080x2160
++# UFS:   ufshc @0x1d84000, IRQ SPI 265, QMP v3 PHY, 2 lanes (same family as sweet -- sweet_ufs.c)
++# USB:   dwc3 @0xa600000 (ssusb, ahb2phy 0x88ee000)
++# PMIC:  PM8998 on SPMI @0xc440000 (keys home/vol_up/cam); debug uart: GENI QUP @0xa84000
++# GPU:   Adreno 630 (gpucc/gfxcc @0x5090000); timer 19.2 MHz, standard ARMv8 PPIs
++# RAM:   8GB LPDDR4X, bank0 0x80000000+4G, bank1 0x180000000+0xfc8a0000; big free RAM 0x97d00000-0x27c89ffff
++#        (carve-outs to avoid: 0x85700000-0x8c416000) -- FD_BASE/PAYLOAD_BASE above land in free RAM
+diff --git a/common/devices/enchilada.platform.c b/common/devices/enchilada.platform.c
+new file mode 100644
+index 0000000..2a24cd4
+--- /dev/null
++++ b/common/devices/enchilada.platform.c
+@@ -0,0 +1,14 @@
++/*
++ * enchilada: paste into xnuloader/loader.c next to platform_redwood and add &platform_enchilada to platforms[].
++ * Every value is explained in docs/PORTING.md ("The loader").
++ */
++static const struct platform platform_enchilada = {
++	.name = "enchilada",
++	.io_base = 0x00400000, .io_size = 0x3FC00000,   /* TODO: one window over the SoC's peripherals, non-zero base */
++	.gic_dist = 0x17a00000, .gic_redist = 0x17a60000,
++	.uart = 0,                                      /* phones: no PL011 */
++	.log_other_cpu = 1,
++	.cores = 8, .core_shift = 8,
++	.small_cores = 0x0,                          /* TODO: a bit per "small" core (capacity-dmips-mhz in the DT) */
++	.fb_base = 0x0,                                 /* TODO: the framebuffer base the UEFI prints ("display ... at") */
++};
+diff --git a/xnu-build.sh b/xnu-build.sh
+index 8f851bb..01ba6a2 100755
+--- a/xnu-build.sh
++++ b/xnu-build.sh
+@@ -12,5 +12,6 @@ if [ -d BUILD/obj ] && [ "$(cat $STAMP 2>/dev/null)" != "$now" ]; then
+ 	echo "$now" > $STAMP
+ fi
+ exec make REDWOOD_OBJECTS="$LX" SDKROOT=iphoneos ARCH_CONFIGS=ARM64 MACHINE_CONFIGS=${MACHINE:-BCM2837} KERNEL_CONFIGS=DEVELOPMENT \
++  PLATFORM=iPhoneOS \
+   ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG=arm64 BUILD_WERROR=0 BUILD_LTO=0 DO_CTFMERGE=0 \
+   HOST_CC="clang -include $XNUDEPS/hostinc/hostcompat.h -I$XNUDEPS/hostinc -Wno-unused-command-line-argument -Wno-error=implicit-function-declaration" HOST_FLEX=flex HOST_BISON=bison HOST_GM4=m4 CC=xnu-clang CXX=xnu-clang++ LOGCOLORS=n "$@"
+diff --git a/xnu/files/bsd/dev/redwood_input.c b/xnu/files/bsd/dev/redwood_input.c
+index 8076cf0..5009af3 100644
+--- a/xnu/files/bsd/dev/redwood_input.c
++++ b/xnu/files/bsd/dev/redwood_input.c
+@@ -221,6 +221,7 @@ redwood_input_init(void)
+ 	redwood_battery_init();
+ 	redwood_ufs_init();
+ 	redwood_net_init();
++	redwood_usb_init();
+ 	redwood_adreno_init();
+ 	redwood_wifi_init();
+ 	redwood_adsp_init();
+diff --git a/xnu/files/bsd/dev/redwood_usb.c b/xnu/files/bsd/dev/redwood_usb.c
+new file mode 100644
+index 0000000..b58ff5d
+--- /dev/null
++++ b/xnu/files/bsd/dev/redwood_usb.c
+@@ -0,0 +1,732 @@
++/*
++ * USB: the phone's cable as a network link behind en0 (see sys/redwood_net.h).
++ *
++ * The phone's USB is a Synopsys DWC3 at 0x0a600000 behind Qualcomm's
++ * dwc-usb3-msm wrapper, with a QUSB2 PHY at 0x088e2000; its power domain is
++ * the USB30_PRIM GDSC and its clocks come from GCC. Whoever ran the phone
++ * before us (fastboot, xnuloader) leaves it powered, clocked, in device mode
++ * and halted, with the PHY set up. Boot-arg usb=N:
++ *   1  report only: the state the controller was left in (nothing written);
++ *   2  also start the device: soft reset, an event buffer, endpoint 0, run --
++ *      the computer enumerates the phone;
++ *   3  also CDC-ECM: the computer sees a network adapter, en0's frames go
++ *      over the cable.
++ * Nothing is read before the GCC status registers say the power domain and
++ * the clocks are on: an access to a gated block hangs the machine. Events are
++ * polled from a kernel thread (no interrupt), like the UFS driver. DMA is not
++ * cache coherent here (DT qcom,gsi-disable-io-coherency): buffers are cleaned
++ * and invalidated by hand, and the DMA area is kept below 4 GiB. The register
++ * layout and the control-transfer state machine follow the Synopsys DWC3
++ * databook as used by Linux drivers/usb/dwc3 (gadget.c, ep0.c).
++ */
++#include <arm/caches_internal.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/sched_prim.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/vm_param.h>
++#include <machine/machine_routines.h>
++#include <net/ethernet.h>
++#include <pexpert/pexpert.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/param.h>
++#include <sys/redwood_net.h>
++#include <sys/systm.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++
++static struct redwood_net_link usb_link;
++
++#define GCC_PA                  0x00100000
++#define GCC_SIZE                0x00090000
++#define GCC_USB30_PRIM_GDSCR    0x0f004         /* bit 31: power on */
++#define CBCR_CLK_OFF            (1u << 31)
++
++static const struct {
++	const char *name;
++	uint32_t    off;
++} usb_cbcr[] = {
++	{ "master", 0x0f010 },
++	{ "sleep", 0x0f014 },
++	{ "utmi", 0x0f018 },
++	{ "cfg-noc-axi", 0x0502c },
++	{ "aggre-axi", 0x8201c },
++	{ "ahb2phy", 0x6a004 },
++	{ "clkref", 0x8c010 },
++};
++
++#define DWC3_PA                 0x0a600000
++#define DWC3_SIZE               0x0000d000
++#define QUSB2_PA                0x088e2000
++#define QUSB2_SIZE              0x00000400
++
++static uint32_t
++usb_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++/*
++ * Step 2: the device itself (usb=2). Only the device controller is restarted:
++ * soft reset, an event buffer in our memory, endpoint 0, run. The controller
++ * only connects (pull-up on D+) while it sees a valid VBUS session; the
++ * wrapper's registers force that in software (Linux dwc3-qcom's vbus
++ * override).
++ */
++#define GCTL            0xc110
++#define GEVNTADRLO      0xc400
++#define GEVNTADRHI      0xc404
++#define GEVNTSIZ        0xc408
++#define GEVNTCOUNT      0xc40c
++#define DCFG            0xc700
++#define DCTL            0xc704
++#define DEVTEN          0xc708
++#define DSTS            0xc70c
++#define DALEPENA        0xc720
++#define DEPCMDPAR2(n)   (0xc800 + 0x10 * (n))
++#define DEPCMDPAR1(n)   (0xc804 + 0x10 * (n))
++#define DEPCMDPAR0(n)   (0xc808 + 0x10 * (n))
++#define DEPCMD(n)       (0xc80c + 0x10 * (n))
++
++#define DCTL_RUN_STOP   (1u << 31)
++#define DCTL_CSFTRST    (1u << 30)
++#define DSTS_DEVCTRLHLT (1u << 22)
++
++#define DEPCMD_SETEPCONFIG      1
++#define DEPCMD_SETTRANSFRESOURCE 2
++#define DEPCMD_SETSTALL         4
++#define DEPCMD_STARTTRANSFER    6
++#define DEPCMD_DEPSTARTCFG      9
++#define DEPCMD_CMDACT           (1u << 10)
++
++#define TRB_HWO         (1u << 0)
++#define TRB_LST         (1u << 1)
++#define TRB_ISP_IMI     (1u << 10)
++#define TRB_IOC         (1u << 11)
++#define TRBCTL_NORMAL   (1u << 4)
++#define TRBCTL_SETUP    (2u << 4)
++#define TRBCTL_STATUS2  (3u << 4)
++#define TRBCTL_STATUS3  (4u << 4)
++#define TRBCTL_DATA     (5u << 4)
++
++/* DMA area layout */
++#define UD_EVT          0x0000          /* event buffer, 4 KiB */
++#define UD_EVT_SIZE     0x1000
++#define UD_TRB_OUT      0x1000          /* ep0 OUT TRB */
++#define UD_TRB_IN       0x1010          /* ep0 IN TRB */
++#define UD_TRB_RX       0x1020          /* ep1 OUT (bulk, host -> phone) */
++#define UD_TRB_TX       0x1030          /* ep1 IN (bulk, phone -> host) */
++#define UD_TRB_INT      0x1050          /* ep2 IN (interrupt, notifications) */
++#define UD_SETUP        0x1060          /* 8-byte setup packet */
++#define UD_DATA         0x1100          /* ep0 data stage, 512 bytes */
++#define UD_NOTIFY       0x1300          /* 16-byte notification */
++#define UD_RX           0x2000          /* one received frame */
++#define UD_FRAME_MAX    0x800
++#define UD_TXQ          8               /* frames waiting for the IN endpoint */
++#define UD_TX_BASE      0x2800          /* UD_TXQ frames of UD_FRAME_MAX */
++#define UD_SIZE         (UD_TX_BASE + UD_TXQ * UD_FRAME_MAX)
++
++/* Physical endpoints: 2n = OUT, 2n+1 = IN */
++#define EP_RX           2               /* 0x01 bulk OUT */
++#define EP_TX           3               /* 0x81 bulk IN */
++#define EP_INT          5               /* 0x82 interrupt IN */
++
++/* Qualcomm wrapper registers ("QSCRATCH", core base + 0xf8800). */
++#define QSCRATCH_PA             0x0a6f8800
++#define QSCRATCH_HS_PHY_CTRL    0x10
++#define   UTMI_OTG_VBUS_VALID   (1u << 20)
++#define   SW_SESSVLD_SEL        (1u << 28)
++#define QSCRATCH_SS_PHY_CTRL    0x30
++#define   LANE0_PWR_PRESENT     (1u << 24)
++
++static struct {
++	vm_offset_t dwc;
++	vm_offset_t dma;
++	uint64_t    dma_pa;
++	uint32_t    evt_pos;
++	int         sleep_chan;
++	enum { EP0_SETUP, EP0_DATA, EP0_WAIT_STATUS2, EP0_WAIT_STATUS3, EP0_STATUS } state;
++	bool        data_in;        /* data stage direction */
++	uint32_t    events;
++	bool        configured;     /* SET_CONFIGURATION(1) done: the bulk endpoints are live */
++	bool        ecm;            /* usb=3: en0's frames go over the cable */
++	bool        link_up;
++	/* transmit: the frame being sent, then the queued ones */
++	bool        tx_busy;
++	uint32_t    tx_head, tx_count;
++	uint32_t    tx_off[UD_TXQ], tx_len[UD_TXQ];
++	uint64_t    rx_frames, tx_frames;
++} ud;
++
++static LCK_GRP_DECLARE(usb_lck_grp, "redwood-usb");
++static LCK_MTX_DECLARE(usb_tx_lock, &usb_lck_grp);
++
++static inline void
++dwc_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(ud.dwc + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static inline uint32_t
++dwc_rd(uint32_t off)
++{
++	return usb_rd(ud.dwc, off);
++}
++
++static void
++ud_sync(uint32_t off, uint32_t len)
++{
++	flush_dcache64((addr64_t)(ud.dma_pa + off), len, TRUE);
++}
++
++static void
++ud_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&ud.sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static int
++ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
++{
++	dwc_wr(DEPCMDPAR0(ep), p0);
++	dwc_wr(DEPCMDPAR1(ep), p1);
++	dwc_wr(DEPCMDPAR2(ep), p2);
++	dwc_wr(DEPCMD(ep), cmd | DEPCMD_CMDACT);
++	for (int i = 0; i < 1000; i++) {
++		uint32_t v = dwc_rd(DEPCMD(ep));
++		if (!(v & DEPCMD_CMDACT)) {
++			uint32_t status = (v >> 12) & 0xf;
++			if (status) {
++				printf("usb: ep%u cmd 0x%x status %u\n", ep, cmd & 0xf, status);
++				return -1;
++			}
++			return 0;
++		}
++		delay(1);
++	}
++	printf("usb: ep%u cmd 0x%x timeout\n", ep, cmd & 0xf);
++	return -1;
++}
++
++/* One TRB (at DMA offset trb) on physical endpoint ep. */
++static void
++ud_start_trb(unsigned ep, uint32_t trb, uint32_t buf, uint32_t len, uint32_t ctl)
++{
++	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + trb);
++	uint64_t bpa = ud.dma_pa + buf;
++
++	t[0] = (uint32_t)bpa;
++	t[1] = (uint32_t)(bpa >> 32);
++	t[2] = len;
++	t[3] = ctl | TRB_HWO | TRB_LST | TRB_ISP_IMI | TRB_IOC;
++	ud_sync(trb, 16);
++	if (len) {
++		ud_sync(buf, len);
++	}
++	uint64_t tpa = ud.dma_pa + trb;
++	ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0);
++}
++
++static void
++ud_start(unsigned ep, uint32_t buf, uint32_t len, uint32_t ctl)
++{
++	ud_start_trb(ep, ep ? UD_TRB_IN : UD_TRB_OUT, buf, len, ctl);
++}
++
++static void
++ud_start_setup(void)
++{
++	ud.state = EP0_SETUP;
++	ud_start(0, UD_SETUP, 8, TRBCTL_SETUP);
++}
++
++static void
++ud_stall(void)
++{
++	ud_epcmd(0, DEPCMD_SETSTALL, 0, 0, 0);
++	ud_start_setup();
++}
++
++/*
++ * USB descriptors: a CDC-ECM (Ethernet) function, which Linux (cdc_ether) and
++ * macOS drive without extra drivers. VID 0x1209 / PID 0x0001 = pid.codes test
++ * ID, not a product.
++ */
++static const uint8_t ud_dev_desc[18] = {
++	18, 1, 0x00, 0x02, 0x02, 0x00, 0x00, 64,
++	0x09, 0x12, 0x01, 0x00, 0x00, 0x01, 1, 2, 3, 1,
++};
++static const uint8_t ud_cfg_desc[80] = {
++	9, 2, 80, 0, 2, 1, 0, 0x80, 250,                /* config: 2 interfaces, 500 mA */
++	9, 4, 0, 0, 1, 0x02, 0x06, 0x00, 0,             /* comm interface 0: CDC ECM, 1 endpoint */
++	5, 0x24, 0x00, 0x10, 0x01,                      /* header, CDC 1.10 */
++	5, 0x24, 0x06, 0, 1,                            /* union: control 0, data 1 */
++	13, 0x24, 0x0f, 4, 0, 0, 0, 0, 0xea, 0x05, 0, 0, 0, /* ethernet: MAC string 4, max segment 1514 */
++	7, 5, 0x82, 0x03, 16, 0, 9,                     /* ep 0x82 interrupt IN, 16 bytes, 2^(9-1) uframes */
++	9, 4, 1, 0, 0, 0x0a, 0x00, 0x00, 0,             /* data interface 1 alt 0: no endpoints */
++	9, 4, 1, 1, 2, 0x0a, 0x00, 0x00, 0,             /* data interface 1 alt 1: two bulk endpoints */
++	7, 5, 0x81, 0x02, 0x00, 0x02, 0,                /* ep 0x81 bulk IN, 512 */
++	7, 5, 0x01, 0x02, 0x00, 0x02, 0,                /* ep 0x01 bulk OUT, 512 */
++};
++static const char *const ud_strings[] = {
++	NULL, "redwood", "redwood USB Ethernet", "0001", "02005E77EE01",
++};
++/* en0's address (the host side's is the one in the string above) */
++static const uint8_t ud_phone_mac[ETHER_ADDR_LEN] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x02 };
++
++static uint32_t
++ud_string(unsigned idx, uint8_t *out)
++{
++	if (idx == 0) {
++		out[0] = 4; out[1] = 3; out[2] = 0x09; out[3] = 0x04;   /* en-US */
++		return 4;
++	}
++	if (idx >= sizeof(ud_strings) / sizeof(ud_strings[0])) {
++		return 0;
++	}
++	const char *str = ud_strings[idx];
++	uint32_t n = 2;
++	for (; *str && n < 126; str++) {
++		out[n++] = (uint8_t)*str;
++		out[n++] = 0;
++	}
++	out[0] = (uint8_t)n;
++	out[1] = 3;
++	return n;
++}
++
++static void ud_rx_arm(void);
++static void ud_tx_start_next_locked(void);
++
++/* NETWORK_CONNECTION notification: the host brings its link up on it. */
++static void
++ud_notify_connected(void)
++{
++	uint8_t *n = (uint8_t *)(ud.dma + UD_NOTIFY);
++	n[0] = 0xa1; n[1] = 0x00;       /* NETWORK_CONNECTION */
++	n[2] = 1; n[3] = 0;             /* connected */
++	n[4] = 0; n[5] = 0;             /* interface 0 */
++	n[6] = 0; n[7] = 0;
++	ud_start_trb(EP_INT, UD_TRB_INT, UD_NOTIFY, 8, TRBCTL_NORMAL);
++}
++
++static void
++ud_link_up(void)
++{
++	if (ud.ecm && !ud.link_up) {
++		ud.link_up = true;
++		redwood_net_link_state(true);
++	}
++}
++
++/* One received frame's place; the event thread re-arms it after each frame. */
++static void
++ud_rx_arm(void)
++{
++	ud_start_trb(EP_RX, UD_TRB_RX, UD_RX, UD_FRAME_MAX, TRBCTL_NORMAL);
++}
++
++/* SET_CONFIGURATION(1): the bulk IN/OUT pair and the interrupt endpoint. */
++static void
++ud_configure(void)
++{
++	if (ud.configured) {
++		return;
++	}
++	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG | (2u << 16), 0, 0, 0) ||
++	    ud_epcmd(EP_RX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3), (1u << 8) | ((uint32_t)EP_RX << 25), 0) ||
++	    ud_epcmd(EP_RX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
++	    ud_epcmd(EP_TX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3) | (1u << 17), (1u << 8) | ((uint32_t)EP_TX << 25), 0) ||
++	    ud_epcmd(EP_TX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
++	    ud_epcmd(EP_INT, DEPCMD_SETEPCONFIG, (3u << 1) | (16u << 3) | (2u << 17),
++	    (1u << 8) | (8u << 16) | ((uint32_t)EP_INT << 25), 0) ||
++	    ud_epcmd(EP_INT, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
++		printf("usb: data endpoints setup failed\n");
++		return;
++	}
++	dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT));
++	ud.configured = true;
++	ud_rx_arm();
++	printf("usb: ECM endpoints configured\n");
++}
++
++static void
++ud_setup(void)
++{
++	const uint8_t *st = (const uint8_t *)(ud.dma + UD_SETUP);
++	uint8_t *data = (uint8_t *)(ud.dma + UD_DATA);
++	uint8_t type = st[0], req = st[1];
++	uint16_t value = (uint16_t)(st[2] | st[3] << 8);
++	uint16_t index = (uint16_t)(st[4] | st[5] << 8);
++	uint16_t length = (uint16_t)(st[6] | st[7] << 8);
++	uint32_t n = 0;
++	bool ok = true;
++
++	printf("usb: setup %02x %02x %04x %04x len %u\n", type, req, value, index, length);
++	ud.data_in = (type & 0x80) != 0;
++	if ((type & 0x60) == 0x20) {    /* class request (e.g. SET_ETHERNET_PACKET_FILTER) */
++		ok = (length == 0);
++	} else if ((type & 0x60) != 0) {
++		ok = false;
++	} else if (req == 6) {          /* GET_DESCRIPTOR */
++		switch (value >> 8) {
++		case 1: memcpy(data, ud_dev_desc, sizeof(ud_dev_desc)); n = sizeof(ud_dev_desc); break;
++		case 2: memcpy(data, ud_cfg_desc, sizeof(ud_cfg_desc)); n = sizeof(ud_cfg_desc); break;
++		case 3: n = ud_string(value & 0xff, data); ok = n != 0; break;
++		default: ok = false; break;
++		}
++	} else if (req == 5) {          /* SET_ADDRESS: takes effect now (DWC3 handles the timing) */
++		uint32_t dcfg = dwc_rd(DCFG) & ~(0x7fu << 3);
++		dwc_wr(DCFG, dcfg | ((uint32_t)(value & 0x7f) << 3));
++		printf("usb: address %u\n", value & 0x7f);
++	} else if (req == 9) {          /* SET_CONFIGURATION */
++		if (value == 1) {
++			ud_configure();
++		}
++		printf("usb: configured (%u)\n", value);
++	} else if (req == 8) {          /* GET_CONFIGURATION */
++		data[0] = ud.configured ? 1 : 0; n = 1;
++	} else if (req == 0) {          /* GET_STATUS */
++		data[0] = 0; data[1] = 0; n = 2;
++	} else if (req == 11) {         /* SET_INTERFACE: the host enables the data interface */
++		if (index == 1 && value == 1 && ud.configured) {
++			ud_notify_connected();
++			ud_link_up();
++		}
++	} else if (req == 10) {         /* GET_INTERFACE */
++		data[0] = index == 1 && ud.configured ? 1 : 0; n = 1;
++	} else if (req == 1 || req == 3) { /* CLEAR/SET_FEATURE (halt, remote wakeup) */
++	} else {
++		ok = false;
++	}
++	if (!ok) {
++		ud_stall();
++		return;
++	}
++	if (length == 0) {
++		ud.state = EP0_WAIT_STATUS2;    /* status stage on XferNotReady */
++		return;
++	}
++	ud.state = EP0_DATA;
++	if (ud.data_in) {
++		if (n > length) {
++			n = length;
++		}
++		ud_start(1, UD_DATA, n, TRBCTL_DATA);
++	} else {
++		ud_start(0, UD_DATA, 64, TRBCTL_DATA);  /* OUT data is not used here */
++	}
++}
++
++static void
++ud_rx_done(void)
++{
++	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
++
++	ud_sync(UD_TRB_RX, 16);
++	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
++	ud_sync(UD_RX, UD_FRAME_MAX);
++	if (ud.ecm && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
++		redwood_net_input((const uint8_t *)(ud.dma + UD_RX), len);
++		ud.rx_frames++;
++	}
++	ud_rx_arm();
++}
++
++/* Start the oldest queued frame if the IN endpoint is idle. usb_tx_lock held. */
++static void
++ud_tx_start_next_locked(void)
++{
++	if (ud.tx_busy || ud.tx_count == 0 || !ud.configured) {
++		return;
++	}
++	uint32_t i = ud.tx_head % UD_TXQ;
++	ud.tx_head++;
++	ud.tx_count--;
++	ud.tx_busy = true;
++	ud.tx_frames++;
++	ud_start_trb(EP_TX, UD_TRB_TX, ud.tx_off[i], ud.tx_len[i], TRBCTL_NORMAL);
++}
++
++/* A frame of en0's to send. The packet stays the caller's: copied here. */
++static bool
++usb_transmit(mbuf_t packet, size_t length)
++{
++	lck_mtx_lock(&usb_tx_lock);
++	if (!ud.configured || ud.tx_count == UD_TXQ) {
++		lck_mtx_unlock(&usb_tx_lock);
++		return false;
++	}
++	uint32_t i = (ud.tx_head + ud.tx_count) % UD_TXQ;
++	uint32_t off = UD_TX_BASE + i * UD_FRAME_MAX;
++	size_t len = length;
++	if (mbuf_copydata(packet, 0, len, (void *)(ud.dma + off)) != 0) {
++		lck_mtx_unlock(&usb_tx_lock);
++		return false;
++	}
++	/* A frame of a multiple of 512 bytes would wait for a zero-length packet
++	 * to end it; one pad byte does the same (the receiver ignores it). */
++	if ((len % 512) == 0) {
++		((uint8_t *)(ud.dma + off))[len++] = 0;
++	}
++	ud.tx_off[i] = off;
++	ud.tx_len[i] = (uint32_t)len;
++	ud.tx_count++;
++	ud_tx_start_next_locked();
++	lck_mtx_unlock(&usb_tx_lock);
++	return true;
++}
++
++static void
++ud_event(uint32_t ev)
++{
++	if (ev & 1) {                   /* device event */
++		uint32_t type = (ev >> 8) & 0xf;
++		if (type == 1) {        /* USB reset */
++			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
++			if (ud.link_up) {
++				ud.link_up = false;
++				redwood_net_link_state(false);
++			}
++			printf("usb: bus reset\n");
++		} else if (type == 2) { /* connect done */
++			uint32_t speed = dwc_rd(DSTS) & 7;
++			/* ep0 max packet: 64 at high/full speed (modify action) */
++			ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3) | (2u << 30),
++			    (1u << 8) | (1u << 10) | (0u << 25), 0);
++			ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3) | (2u << 30),
++			    (1u << 8) | (1u << 10) | (1u << 25), 0);
++			printf("usb: connected, speed %u\n", speed);
++		} else if (type == 0) {
++			if (ud.link_up) {
++				ud.link_up = false;
++				redwood_net_link_state(false);
++			}
++			printf("usb: disconnect\n");
++		}
++		return;
++	}
++	unsigned ep = (ev >> 1) & 0x1f;
++	unsigned type = (ev >> 6) & 0xf;
++	unsigned status = (ev >> 12) & 0xf;
++
++	if (ep == EP_RX && type == 1) {         /* XferComplete */
++		ud_rx_done();
++		return;
++	}
++	if (ep == EP_TX && type == 1) {
++		lck_mtx_lock(&usb_tx_lock);
++		ud.tx_busy = false;
++		ud_tx_start_next_locked();
++		lck_mtx_unlock(&usb_tx_lock);
++		return;
++	}
++	if (ep > 1) {
++		return;
++	}
++	/*
++	 * Control transfer state machine (Linux dwc3 ep0.c): SETUP completes ->
++	 * request handled; the data stage (if any) is started right away; the
++	 * status stage is started when the controller reports XferNotReady
++	 * with status "control status"; its completion re-arms SETUP.
++	 */
++	if (type == 1) {                /* XferComplete */
++		switch (ud.state) {
++		case EP0_SETUP:
++			ud_sync(UD_SETUP, 8);
++			ud_setup();
++			break;
++		case EP0_DATA:
++			ud.state = EP0_WAIT_STATUS3;
++			break;
++		case EP0_STATUS:
++			ud_start_setup();
++			break;
++		default:
++			break;
++		}
++		return;
++	}
++	if (type == 3 && status == 2) { /* XferNotReady, control status phase */
++		if (ud.state == EP0_WAIT_STATUS2 || ud.state == EP0_WAIT_STATUS3) {
++			uint32_t ctl = ud.state == EP0_WAIT_STATUS3 ? TRBCTL_STATUS3 : TRBCTL_STATUS2;
++			ud.state = EP0_STATUS;
++			ud_start(ep, UD_DATA, 0, ctl);
++		}
++	}
++}
++
++static void
++ud_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	for (;;) {
++		uint32_t count = dwc_rd(GEVNTCOUNT) & 0xffff;
++		if (count) {
++			ud_sync(UD_EVT, UD_EVT_SIZE);
++			for (uint32_t done = 0; done < count; done += 4) {
++				uint32_t ev = *(volatile uint32_t *)(ud.dma + UD_EVT + ud.evt_pos);
++				ud.evt_pos = (ud.evt_pos + 4) % UD_EVT_SIZE;
++				if (ud.events++ < 200) {
++					printf("usb: event 0x%08x\n", ev);
++				}
++				ud_event(ev);
++			}
++			dwc_wr(GEVNTCOUNT, count);
++		}
++		ud_sleep_ms(1);
++	}
++}
++
++static void
++usb_gadget_start(vm_offset_t dwc)
++{
++	thread_t thread;
++
++	ud.dwc = dwc;
++	/* below 4 GiB: the descriptor registers (GEVNTADR) and the TRBs take a
++	 * 32-bit address on this controller */
++	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK,
++	    atop_64(0xFFFFFFFFULL), 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("usb: no DMA memory\n");
++		return;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ud.dma);
++	if (!pn) {
++		return;
++	}
++	ud.dma_pa = ptoa_64(pn);
++
++	/* en0 carries its frames over this link from now (the host brings it up) */
++	if (ud.ecm && !redwood_net_attach(&usb_link)) {
++		printf("usb: en0 is taken; the cable stays a plain device\n");
++	}
++
++	/* Device controller soft reset (PHY and global setup stay as the loader left them). */
++	dwc_wr(DCTL, DCTL_CSFTRST);
++	int i;
++	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
++		delay(1000);
++	}
++	printf("usb: soft reset %s after %d ms, GCTL 0x%08x DCFG 0x%08x\n",
++	    (dwc_rd(DCTL) & DCTL_CSFTRST) ? "STUCK" : "done", i, dwc_rd(GCTL), dwc_rd(DCFG));
++	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
++		return;
++	}
++
++	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
++	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
++	dwc_wr(GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);     /* interrupt masked: polled */
++	dwc_wr(GEVNTCOUNT, dwc_rd(GEVNTCOUNT) & 0xffff);
++	ud.evt_pos = 0;
++
++	/* High speed, address 0 */
++	uint32_t dcfg = dwc_rd(DCFG) & ~(7u | (0x7fu << 3));
++	dwc_wr(DCFG, dcfg | 0);
++	/* Events: disconnect, USB reset, connect done */
++	dwc_wr(DEVTEN, 0x7);
++
++	/* Endpoint 0 OUT/IN: start config, control type, max packet 512 until connect done. */
++	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0) ||
++	    ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (0u << 25), 0) ||
++	    ud_epcmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
++	    ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (1u << 25), 0) ||
++	    ud_epcmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
++		printf("usb: endpoint 0 setup failed\n");
++		return;
++	}
++	dwc_wr(DALEPENA, 0x3);
++	ud_start_setup();
++
++	/* The VBUS override: without it the controller never sees a session. */
++	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
++	if (qs != 0) {
++		uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL), ss = usb_rd(qs, QSCRATCH_SS_PHY_CTRL);
++		printf("usb: QSCRATCH HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x\n", hs, ss);
++		*(volatile uint32_t *)(qs + QSCRATCH_HS_PHY_CTRL) = hs | UTMI_OTG_VBUS_VALID | SW_SESSVLD_SEL;
++		*(volatile uint32_t *)(qs + QSCRATCH_SS_PHY_CTRL) = ss | LANE0_PWR_PRESENT;
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++
++	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
++	for (i = 0; i < 500 && (dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
++		delay(1000);
++	}
++	printf("usb: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n", dwc_rd(DSTS), i, ud.dma_pa);
++	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
++static struct redwood_net_link usb_link = {
++	.name = "the cable (CDC-ECM)",
++	.address = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x02 },
++	.up = false,                    /* the host brings the link up (SET_INTERFACE alt 1) */
++	.transmit = usb_transmit,
++	.poll = NULL,                   /* events are polled by our own thread */
++};
++
++void
++redwood_usb_init(void)
++{
++	uint32_t mode = 0;
++
++	/* usb=0 off, 1 report state only, 2 also start the USB device, 3 also ECM on en0 */
++	if (!PE_parse_boot_argn("usb", &mode, sizeof(mode)) || mode == 0) {
++		return;
++	}
++	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
++	if (gcc == 0) {
++		printf("usb: GCC map failed\n");
++		return;
++	}
++	uint32_t gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++	printf("usb: GDSC usb30_prim 0x%08x (%s)\n", gdscr, (gdscr & (1u << 31)) ? "on" : "off");
++	uint32_t cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
++	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
++		cbcr[i] = usb_rd(gcc, usb_cbcr[i].off);
++		printf("usb: clk %-12s CBCR 0x%08x (%s)\n", usb_cbcr[i].name, cbcr[i],
++		    (cbcr[i] & CBCR_CLK_OFF) ? "off" : "on");
++	}
++	/* DWC3 registers need the GDSC, the master clock and the config-NoC path. */
++	if (!((gdscr & (1u << 31)) && !(cbcr[0] & CBCR_CLK_OFF) && !(cbcr[3] & CBCR_CLK_OFF))) {
++		printf("usb: controller unpowered or unclocked; DWC3 not read\n");
++		return;
++	}
++	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
++	if (dwc == 0) {
++		printf("usb: DWC3 map failed\n");
++		return;
++	}
++	printf("usb: DWC3 GSNPSID 0x%08x GCTL 0x%08x GSTS 0x%08x GUSB2PHYCFG 0x%08x\n",
++	    usb_rd(dwc, 0xc120), usb_rd(dwc, 0xc110), usb_rd(dwc, 0xc118), usb_rd(dwc, 0xc200));
++	printf("usb: DWC3 DCFG 0x%08x DCTL 0x%08x DEVTEN 0x%08x DSTS 0x%08x DALEPENA 0x%08x\n",
++	    usb_rd(dwc, 0xc700), usb_rd(dwc, 0xc704), usb_rd(dwc, 0xc708), usb_rd(dwc, 0xc70c),
++	    usb_rd(dwc, 0xc720));
++	printf("usb: DWC3 GEVNTADR 0x%08x%08x GEVNTSIZ 0x%08x GEVNTCOUNT 0x%08x GHWPARAMS0 0x%08x\n",
++	    usb_rd(dwc, 0xc404), usb_rd(dwc, 0xc400), usb_rd(dwc, 0xc408), usb_rd(dwc, 0xc40c),
++	    usb_rd(dwc, 0xc140));
++	if (cbcr[5] & CBCR_CLK_OFF) {
++		printf("usb: ahb2phy clock off; QUSB2 PHY not read\n");
++	} else {
++		vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++		if (phy != 0) {
++			printf("usb: QUSB2 PLL_STATUS 0x%08x PWR_CTRL1 0x%08x PORT_TUNE1 0x%08x TEST1 0x%08x\n",
++			    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240), usb_rd(phy, 0x254));
++		}
++	}
++	ud.ecm = mode >= 3;
++	if (mode >= 2) {
++		usb_gadget_start(dwc);
++	}
++}
+diff --git a/xnu/files/bsd/sys/redwood_input.h b/xnu/files/bsd/sys/redwood_input.h
+index bb8ad1b..eebdcbf 100644
+--- a/xnu/files/bsd/sys/redwood_input.h
++++ b/xnu/files/bsd/sys/redwood_input.h
+@@ -71,6 +71,7 @@ struct redwood_battery_state {
+ };
+ void redwood_battery_report(const struct redwood_battery_state *state);
+ void redwood_net_init(void);            /* en0, if there is something to carry its frames: sys/redwood_net.h */
++void redwood_usb_init(void);            /* boot-arg usb=N: the cable: 1 probe the state, 2 a USB device, 3 CDC-ECM, en0's frames over it */
+ void redwood_cpufreq_init(void);        /* boot-arg cpufreq=1: the phone's processor at full speed */
+ void redwood_adreno_init(void);         /* boot-arg adreno=N: the first N steps of waking the phone's GPU */
+ void redwood_adreno_quiesce(void);      /* on the way back to the loader: the GPU block stopped, out of our memory */
+diff --git a/xnu/files/iokit/Kernel/GenericARMPE.cpp b/xnu/files/iokit/Kernel/GenericARMPE.cpp
+index cfaa292..e51ca93 100644
+--- a/xnu/files/iokit/Kernel/GenericARMPE.cpp
++++ b/xnu/files/iokit/Kernel/GenericARMPE.cpp
+@@ -300,9 +300,22 @@ GenericARMPE::start(IOService * provider)
+ 
+ 	/* Stand-ins for the closed graphics drivers that the iOS window server talks to. */
+ 	MiniIOSurfaceStart(this);
+-	MiniIOMobileFramebufferStart(this);
++	/*
++	 * nodisp=1: leave the display driver out (a panel the framebuffer stand-in cannot
++	 * bring up may hang its start -- and the root filesystem does not need a screen).
++	 */
++	int nodisp = 0;
++	(void) PE_parse_boot_argn("nodisp", &nodisp, sizeof(nodisp));
++	if (nodisp) {
++		IOLog("GenericARMPE: nodisp=1, no display driver\n");
++	} else {
++		MiniIOMobileFramebufferStart(this);
++	}
++	IOLog("GenericARMPE: before keystore\n");
+ 	MiniAppleKeyStoreStart();
++	IOLog("GenericARMPE: before netstack\n");
+ 	MiniIONetworkStackStart();
++	IOLog("GenericARMPE: PE start done\n");
+ 	return true;
+ }
+ 
+diff --git a/xnu/files/osfmk/arm64/gic_v3_irq.c b/xnu/files/osfmk/arm64/gic_v3_irq.c
+index 63ffd4b..8f5b0d0 100644
+--- a/xnu/files/osfmk/arm64/gic_v3_irq.c
++++ b/xnu/files/osfmk/arm64/gic_v3_irq.c
+@@ -305,17 +305,59 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
+ 		uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
+ 		uint32_t intid = (uint32_t)(iar & 0xffffff);
+ 
++		{
++			static unsigned gic_irq_dbg_count;
++			extern void loader_log_hex(const char *prefix, uint64_t value);
++
++			if (gic_irq_dbg_count < 8) {
++				gic_irq_dbg_count++;
++				loader_log_hex("gic: irq iar ", iar);
++			}
++		}
++
+ 		if (intid >= GIC_INTID_SPURIOUS_MIN) {
+ 			break;
+ 		}
+ 		gic_active_iar[cpu] = iar | GIC_IAR_TAKEN;
+ 
+-		if (intid == GIC_INTID_VTIMER) {
++		if (intid == GIC_INTID_VTIMER || (intid >= 16 && intid <= 19)) {
++			/*
++			 * Timer expiry, on the standard virtual-timer PPI (27) or -- when a
++			 * hypervisor remaps it (qcom device trees route the arch timers at
++			 * PPI 0-3) -- on INTIDs 16-19. Same sequence as the FIQ path.
++			 */
++			static unsigned tmr_dbg_count;
++			if (tmr_dbg_count++ < 4) {
++				extern void loader_log_hex(const char *prefix, uint64_t value);
++
++				loader_log_hex("gic: timer intid ", intid);
++			}
+ 			/* same sequence as the FIQ path in sleh_fiq() */
+ 			getCpuDatap()->cpu_decrementer = -1; /* Large */
+ 			rtclock_intr(TRUE);
+ 		} else if (intid == GIC_SGI_SIGNAL) {
+-			cpu_signal_handler();
++			static unsigned gic_sgi0_run;
++			extern void loader_log_hex(const char *prefix, uint64_t value);
++
++			gic_sgi0_run++;
++			if (gic_sgi0_run <= 4 || (gic_sgi0_run % 100) == 0) {
++				loader_log_hex("gic: sgi0 handle #", gic_sgi0_run);
++				loader_log_hex("gic: sgi0 sig mask ", getCpuDatap()->cpu_signal);
++			}
++
++			if (gic_sgi0_run > 1000) {
++				/*
++				 * Bring-up: nothing in the kernel is signalling this much this early.
++				 * Something outside (hypervisor/firmware remnants) keeps injecting
++				 * SGI 0; left alone it starves everything else. Mask it and say so.
++				 */
++				if (gic_sgi0_run == 1001) {
++					gic_mask(intid);
++					loader_log_hex("gic: sgi0 storm masked, sig ", getCpuDatap()->cpu_signal);
++				}
++			} else {
++				cpu_signal_handler();
++			}
+ 		} else if (intid == GIC_SGI_STOP) {
+ 			/* comes back only if nobody has in fact asked for that */
+ 			psci_smp_stop_here();
+@@ -418,7 +460,13 @@ gic_v3_irq_cpu_init(void)
+ {
+ 	int cpu = cpu_number();
+ 	vm_offset_t gicr;
+-	uint32_t mine = 1u << GIC_INTID_VTIMER;
++	/*
++	 * The standard virtual-timer PPI (27) plus INTIDs 16-19: on a machine
++	 * running under Qualcomm's hypervisor, the device tree routes the arch
++	 * timers there (PPI 0-3) -- the hypervisor emulates the timer registers
++	 * and injects the expiry at its own, remapped interrupt numbers.
++	 */
++	uint32_t mine = (1u << GIC_INTID_VTIMER) | 0xF0000u;
+ 
+ 	if (gicd_base == 0) {
+ 		DTEntry entry;
+@@ -478,6 +526,38 @@ gic_v3_irq_cpu_init(void)
+ 	gic_write32(gicr + GICR_IGRPMODR0, gic_read32(gicr + GICR_IGRPMODR0) & ~mine);
+ 	*(volatile uint8_t *)(gicr + GICR_IPRIORITYR(GIC_INTID_VTIMER)) = GIC_PRIORITY_DEFAULT;
+ 	gic_write32(gicr + GICR_ISENABLER0, mine);
++	{
++		/* Did the enables stick? (a hypervisor-owned redistributor may drop them) */
++		extern void loader_log_puts(const char *s);
++		uint32_t en = gic_read32(gicr + GICR_ISENABLER0);
++		uint32_t grp = gic_read32(gicr + GICR_IGROUPR0);
++		uint32_t dctlr = gic_read32(gicd_base + GICD_CTLR);
++		char b[128];
++		const char *hex = "0123456789abcdef";
++		char *p = b;
++		const char *pre = "gic: en=";
++		for (const char *l = pre; *l; ) {
++			*p++ = *l++;
++		}
++		for (int sh = 28; sh >= 0; sh -= 4) {
++			*p++ = hex[(en >> sh) & 0xF];
++		}
++		for (const char *l = " grp="; *l; ) {
++			*p++ = *l++;
++		}
++		for (int sh = 28; sh >= 0; sh -= 4) {
++			*p++ = hex[(grp >> sh) & 0xF];
++		}
++		for (const char *l = " dctlr="; *l; ) {
++			*p++ = *l++;
++		}
++		for (int sh = 28; sh >= 0; sh -= 4) {
++			*p++ = hex[(dctlr >> sh) & 0xF];
++		}
++		*p++ = '\n';
++		*p = 0;
++		loader_log_puts(b);
++	}
+ 
+ 	/* Distributor: affinity routing, Group 1 enabled (normally already so) */
+ 	uint32_t ctlr = gic_read32(gicd_base + GICD_CTLR);
+diff --git a/xnu/files/osfmk/arm64/loader_return.c b/xnu/files/osfmk/arm64/loader_return.c
+index a058bb5..6d87d47 100644
+--- a/xnu/files/osfmk/arm64/loader_return.c
++++ b/xnu/files/osfmk/arm64/loader_return.c
+@@ -133,6 +133,28 @@ loader_log_line(const char *line)
+ 	__builtin_arm_wsr64("DAIF", daif);
+ }
+ 
++void loader_log_hex(const char *prefix, uint64_t value);
++
++void
++loader_log_hex(const char *prefix, uint64_t value)
++{
++	static const char digits[] = "0123456789abcdef";
++	char line[64];
++	char *p = line;
++
++	while (*prefix != 0 && p < &line[40]) {
++		*p++ = *prefix++;
++	}
++	*p++ = '0';
++	*p++ = 'x';
++	for (int i = 15; i >= 0; i--) {
++		*p++ = digits[(value >> (i * 4)) & 0xf];
++	}
++	*p++ = '\n';
++	*p = 0;
++	loader_log_line(line);
++}
++
+ static void
+ loader_log_put_locked(char c)
+ {
+@@ -325,7 +347,7 @@ struct msgbuf {
+ };
+ extern struct msgbuf *msgbufp;
+ 
+-static void
++void
+ loader_log_puts(const char *s)
+ {
+ 	for (; *s; s++) {
+diff --git a/xnu/redwood.patch b/xnu/redwood.patch
+index 8f7dd87..5bd2dc1 100644
+--- a/xnu/redwood.patch
++++ b/xnu/redwood.patch
+@@ -62,10 +62,10 @@ index a4d25040f38f..aad72993d139 100644
+  kern_debug.o_INCFLAGS += -I$(SRCROOT)/osfmk
+  
+ diff --git a/bsd/conf/files b/bsd/conf/files
+-index 44274016a4cf..9cd24b42caca 100644
++index 44274016a4cf..4512e7ab8ba3 100644
+ --- a/bsd/conf/files
+ +++ b/bsd/conf/files
+-@@ -109,6 +109,37 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
++@@ -109,6 +109,38 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+  bsd/dev/unix_startup.c			standard
+  
+  bsd/dev/monotonic.c optional monotonic
+@@ -78,6 +78,7 @@ index 44274016a4cf..9cd24b42caca 100644
+ +bsd/dev/redwood_ufshc.c	standard
+ +bsd/dev/redwood_net.c		standard
+ +bsd/dev/redwood_virtio_net.c	standard
+++bsd/dev/redwood_usb.c		standard
+ +bsd/dev/redwood_apple80211.c	standard
+ +bsd/dev/redwood_cpufreq.c	standard
+ +bsd/dev/redwood_adreno.c	standard
+@@ -103,7 +104,7 @@ index 44274016a4cf..9cd24b42caca 100644
+  bsd/dev/dev_perfmon.c optional config_perfmon
+  
+  bsd/libkern/crc32.c			standard
+-@@ -155,6 +186,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
++@@ -155,6 +187,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
+  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
+  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
+@@ -118,7 +119,7 @@ index 44274016a4cf..9cd24b42caca 100644
+  
+  bsd/miscfs/routefs/routefs_ops.c	optional routefs
+  
+-@@ -361,6 +400,7 @@ bsd/security/audit/audit_syscalls.c		standard
++@@ -361,6 +401,7 @@ bsd/security/audit/audit_syscalls.c		standard
+  bsd/security/audit/audit_worker.c		optional config_audit
+  
+  bsd/pthread/pthread_shims.c		standard
+@@ -126,7 +127,7 @@ index 44274016a4cf..9cd24b42caca 100644
+  bsd/pthread/pthread_priority.c		standard
+  bsd/pthread/pthread_workqueue.c		standard
+  
+-@@ -383,6 +423,7 @@ bsd/kern/kern_debug.c			standard
++@@ -383,6 +424,7 @@ bsd/kern/kern_debug.c			standard
+  bsd/kern/kern_symfile.c			standard
+  bsd/kern/kern_descrip.c			standard
+  bsd/kern/kern_guarded.c			standard
+@@ -353,7 +354,7 @@ index 3e6bffa8c48e..43cffb98bdcc 100644
+  mdevremoveall(void)
+  {
+ diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+-index 4df41ba1f61b..16cf4fd8d8f1 100644
++index 4df41ba1f61b..af88974bfc7c 100644
+ --- a/bsd/kern/bsd_init.c
+ +++ b/bsd/kern/bsd_init.c
+ @@ -147,6 +147,13 @@
+@@ -379,7 +380,169 @@ index 4df41ba1f61b..16cf4fd8d8f1 100644
+  
+  #if DEBUG_BSDINIT
+  #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
+-@@ -976,6 +983,14 @@ bsd_init(void)
++@@ -498,6 +505,12 @@ bsd_init(void)
++ #define bsd_init_kprintf(x, ...)
++ #endif
++ 
+++	{
+++		extern void loader_log_puts(const char *s);
+++
+++		loader_log_puts("bsd: enter\n");
+++	}
+++
++ 	throttle_init();
++ 
++ 	printf(copyright);
++@@ -630,6 +643,11 @@ bsd_init(void)
++ 	mac_cred_label_associate_kernel(vfs_context0.vc_ucred);
++ #endif
++ 	proc_update_creds_onproc(kernproc);
+++	{
+++		extern void loader_log_puts(const char *s);
+++
+++		loader_log_puts("bsd: creds ok\n");
+++	}
++ 
++ 	TAILQ_INIT(&kernproc->p_aio_activeq);
++ 	TAILQ_INIT(&kernproc->p_aio_doneq);
++@@ -680,6 +698,11 @@ bsd_init(void)
++ 	 */
++ 	bsd_init_kprintf("calling bsd_bufferinit\n");
++ 	bsd_bufferinit();
+++	{
+++		extern void loader_log_puts(const char *s);
+++
+++		loader_log_puts("bsd: buf ok\n");
+++	}
++ 
++ 	/*
++ 	 * Initialize the calendar.
++@@ -690,6 +713,11 @@ bsd_init(void)
++ 	/* Initialize the file systems. */
++ 	bsd_init_kprintf("calling vfsinit\n");
++ 	vfsinit();
+++	{
+++		extern void loader_log_puts(const char *s);
+++
+++		loader_log_puts("bsd: vfs ok\n");
+++	}
++ 
++ #if CONFIG_PROC_UUID_POLICY
++ 	/* Initial proc_uuid_policy subsystem */
++@@ -704,6 +732,11 @@ bsd_init(void)
++ 	/* Initialize mbuf's. */
++ 	bsd_init_kprintf("calling mbinit\n");
++ 	mbinit();
+++	{
+++		extern void loader_log_puts(const char *s);
+++
+++		loader_log_puts("bsd: mb ok\n");
+++	}
++ 	restricted_in_port_init();
++ #endif /* SOCKETS */
++ 
++@@ -750,6 +783,11 @@ bsd_init(void)
++ 	socketinit();
++ 	bsd_init_kprintf("calling domaininit\n");
++ 	domaininit();
+++	{
+++		extern void loader_log_puts(const char *s);
+++
+++		loader_log_puts("bsd: dom ok\n");
+++	}
++ 	iptap_init();
++ #if FLOW_DIVERT
++ 	flow_divert_init();
++@@ -780,13 +818,28 @@ bsd_init(void)
++ 	/* Initialize kernel memory status notifications */
++ 	bsd_init_kprintf("calling memorystatus_init\n");
++ 	memorystatus_init();
+++	{
+++		extern void loader_log_puts(const char *s);
+++
+++		loader_log_puts("bsd: memstatus ok\n");
+++	}
++ #endif /* CONFIG_MEMORYSTATUS */
++ 
++ 	bsd_init_kprintf("calling sysctl_mib_init\n");
++ 	sysctl_mib_init();
+++	{
+++		extern void loader_log_puts(const char *s);
+++
+++		loader_log_puts("bsd: sysctl ok\n");
+++	}
++ 
++ 	bsd_init_kprintf("calling bsd_autoconf\n");
++ 	bsd_autoconf();
+++	{
+++		extern void loader_log_puts(const char *s);
+++
+++		loader_log_puts("bsd: autoconf ok\n");
+++	}
++ 
++ #if CONFIG_DTRACE
++ 	dtrace_postinit();
++@@ -861,6 +914,11 @@ bsd_init(void)
++ 		int err;
++ 
++ 		bsd_init_kprintf("calling setconf\n");
+++		{
+++			extern void loader_log_puts(const char *s);
+++
+++			loader_log_puts("bsd: pre_root\n");
+++		}
++ 		setconf();
++ #if CONFIG_NETBOOT
++ 		netboot = (mountroot == netboot_mountroot);
++@@ -885,22 +943,47 @@ bsd_init(void)
++ 		}
++ #endif
++ 		printf("cannot mount root, errno = %d\n", err);
+++		{
+++			extern void loader_log_hex(const char *prefix, uint64_t value);
+++
+++			loader_log_hex("bsd: mountroot errno ", (uint64_t)err);
+++		}
++ 	}
++ 
++ 	IOSecureBSDRoot(rootdevice);
+++	{
+++		extern void loader_log_puts(const char *s);
+++
+++		loader_log_puts("bsd: secure ok\n");
+++	}
++ 
++ 	mountlist.tqh_first->mnt_flag |= MNT_ROOTFS;
++ 
++ 	bsd_init_kprintf("calling VFS_ROOT\n");
+++	{
+++		extern void loader_log_puts(const char *s);
+++
+++		loader_log_puts("bsd: pre VFS_ROOT\n");
+++	}
++ 	/* Get the vnode for '/'.  Set fdp->fd_fd.fd_cdir to reference it. */
++ 	if (VFS_ROOT(mountlist.tqh_first, &init_rootvnode, vfs_context_kernel())) {
++ 		panic("bsd_init: cannot find root vnode: %s", PE_boot_args());
++ 	}
+++	{
+++		extern void loader_log_puts(const char *s);
+++
+++		loader_log_puts("bsd: VFS_ROOT ok\n");
+++	}
++ 	(void)vnode_ref(init_rootvnode);
++ 	(void)vnode_put(init_rootvnode);
++ 
++ 	lck_rw_lock_exclusive(&rootvnode_rw_lock);
++ 	set_rootvnode(init_rootvnode);
+++	{
+++		extern void loader_log_puts(const char *s);
+++
+++		loader_log_puts("bsd: root vnode set\n");
+++	}
++ 	lck_rw_unlock_exclusive(&rootvnode_rw_lock);
++ 	init_rootvnode = NULLVP;  /* use rootvnode after this point */
++ 
++@@ -976,6 +1059,14 @@ bsd_init(void)
+  
+  		bsd_init_kprintf("calling devfs_kernel_mount\n");
+  		devfs_kernel_mount(mounthere);
+@@ -394,6 +557,48 @@ index 4df41ba1f61b..16cf4fd8d8f1 100644
+  	}
+  #endif /* DEVFS */
+  
++@@ -1074,8 +1165,33 @@ bsdinit_task(void)
++ #endif
++ 
++ 	bsd_init_kprintf("bsd_do_post - done");
+++	{
+++		extern void loader_log_puts(const char *s);
+++
+++		loader_log_puts("bsd: pre launchd\n");
+++		{
+++			extern int rtclock_get_timer_cnt(void);
+++			extern uint64_t mach_absolute_time(void);
+++
+++			printf("bsd: timer_cnt=%d abs=%llu\n", rtclock_get_timer_cnt(),
+++			    (unsigned long long)mach_absolute_time());
+++			/* live view of the virtual timer while the kernel is still responsive */
+++			uint64_t ctl, cval, ct;
+++			__asm__ volatile ("mrs %0, CNTV_CTL_EL0" : "=r"(ctl));
+++			__asm__ volatile ("mrs %0, CNTV_CVAL_EL0" : "=r"(cval));
+++			__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r"(ct));
+++			printf("bsd: cntv ctl=%llx cval=%llx ct=%llx (cval-ct=%lld)\n",
+++			    (unsigned long long)ctl, (unsigned long long)cval,
+++			    (unsigned long long)ct, (long long)(cval - ct));
+++		}
+++	}
++ 
++ 	load_init_program(p);
+++	{
+++		extern void loader_log_puts(const char *s);
+++
+++		loader_log_puts("bsd: launchd exec returned\n");
+++	}
++ 	lock_trace = 1;
++ }
++ 
++@@ -1109,6 +1225,7 @@ setconf(void)
++ 	kern_return_t   err;
++ 
++ 	err = IOFindBSDRoot(rootdevice, sizeof(rootdevice), &rootdev, &flags);
+++	printf("bsd: IOFindBSDRoot -> %d root=%s dev=%x flags=%x\n", err, rootdevice, rootdev, flags);
++ 	if (err) {
++ 		printf("setconf: IOFindBSDRoot returned an error (%d);"
++ 		    "setting rootdevice to 'sd0a'.\n", err);     /* XXX DEBUG TEMP */
+ diff --git a/bsd/kern/decmpfs.c b/bsd/kern/decmpfs.c
+ index 95192dd62449..b00da803b5b4 100644
+ --- a/bsd/kern/decmpfs.c
+@@ -1309,10 +1514,58 @@ index d0476214e5f0..c81cadfab1d4 100644
+  	if (dq->dq_id == 0) {
+  		dq->dq_flags &= ~DQ_MOD;
+ diff --git a/bsd/vfs/vfs_subr.c b/bsd/vfs/vfs_subr.c
+-index f64d8c647365..f2e13c1aa7f3 100644
++index f64d8c647365..3aa3174cc581 100644
+ --- a/bsd/vfs/vfs_subr.c
+ +++ b/bsd/vfs/vfs_subr.c
+-@@ -10995,7 +10995,7 @@ rmdir_remove_orphaned_appleDouble(vnode_t vp, vfs_context_t ctx, int * restart_f
++@@ -1265,6 +1265,11 @@ vfs_mountroot(void)
++ 		}
++ 
++ 		if (!error) {
+++			{
+++				extern void loader_log_puts(const char *s);
+++
+++				loader_log_puts("mountroot: fs ok\n");
+++			}
++ 			if (bdevvp_rootvp != rootvp) {
++ 				/*
++ 				 * rootvp changed...
++@@ -1292,6 +1297,11 @@ vfs_mountroot(void)
++ 			 *   defaults will have been set, so no reason to bail or care
++ 			 */
++ 			vfs_init_io_attributes(rootvp, mp);
+++			{
+++				extern void loader_log_puts(const char *s);
+++
+++				loader_log_puts("mountroot: ioattr ok\n");
+++			}
++ 
++ 			if (mp->mnt_ioflags & MNT_IOFLAGS_FUSION_DRIVE) {
++ 				root_is_CF_drive = TRUE;
++@@ -1323,6 +1333,11 @@ vfs_mountroot(void)
++ 			 * Probe root file system for additional features.
++ 			 */
++ 			(void)VFS_START(mp, 0, ctx);
+++			{
+++				extern void loader_log_puts(const char *s);
+++
+++				loader_log_puts("mountroot: start ok\n");
+++			}
++ 
++ 			VFSATTR_INIT(&vfsattr);
++ 			VFSATTR_WANTED(&vfsattr, f_capabilities);
++@@ -1383,6 +1398,11 @@ vfs_mountroot(void)
++ 				goto fail;
++ 			}
++ #endif
+++			{
+++				extern void loader_log_puts(const char *s);
+++
+++				loader_log_puts("mountroot: done\n");
+++			}
++ 			KDBG_RELEASE(DBG_MOUNTROOT | DBG_FUNC_END, 0, 3);
++ 			return 0;
++ 		}
++@@ -10995,7 +11015,7 @@ rmdir_remove_orphaned_appleDouble(vnode_t vp, vfs_context_t ctx, int * restart_f
+  	uio_t auio = NULL;
+  	int eofflag, siz = UIO_BUFF_SIZE, alloc_size = 0, nentries = 0;
+  	int open_flag = 0, full_erase_flag = 0;
+@@ -1680,10 +1933,74 @@ index 2b14eda8f68f..09337bad5b01 100644
+ +#endif
+      ")";
+ diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+-index 5219fb0d9ed6..29978e9cff43 100644
++index 5219fb0d9ed6..db4f07d54c3a 100644
+ --- a/iokit/bsddev/IOKitBSDInit.cpp
+ +++ b/iokit/bsddev/IOKitBSDInit.cpp
+-@@ -683,7 +683,14 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
++@@ -678,16 +678,83 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
++ 
++ 	int xchar, dchar;
++ 
+++	/*
+++	 * rootfast=1: decide the root device without any IOKit matching at all.
+++	 * The memory-map RAMDisk becomes a memory device (mdevadd needs no IOKit)
+++	 * and rd=mdN picks it. For machines whose driver matching does not finish
+++	 * (a real device tree keeps a bring-up busy with drivers it has none of).
+++	 */
+++	int rootfast = 0;
+++	(void) PE_parse_boot_argn("rootfast", &rootfast, sizeof(rootfast));
+++	if (rootfast && !didRam) {
+++		didRam = 1;
+++		IORegistryEntry * regEntry;
+++		OSData * rddata;
+++		if ((regEntry = IORegistryEntry::fromPath( "/chosen/memory-map", gIODTPlane ))) {
+++			rddata = (OSData *)regEntry->getProperty("RAMDisk");
+++			if (rddata && rddata->getLength() >= 2 * sizeof(uintptr_t)) {
+++				uintptr_t * ramdParms = (uintptr_t *)rddata->getBytesNoCopy();
+++				(void)mdevadd(-1, ml_static_ptovirt(ramdParms[0]) >> 12, (unsigned int) (ramdParms[1] >> 12), 0);
+++				IOLog("rootfind: fastpath RAMDisk -> md, pa %llx size %llx\n",
+++				    (uint64_t) ramdParms[0], (uint64_t) ramdParms[1]);
+++			}
+++			rddata = (OSData *)regEntry->getProperty("RAMDisk1");
+++			if (rddata && rddata->getLength() >= 2 * sizeof(uintptr_t)) {
+++				uintptr_t * ramdParms = (uintptr_t *)rddata->getBytesNoCopy();
+++				(void)mdevadd(-1, ml_static_ptovirt(ramdParms[0]) >> 12, (unsigned int) (ramdParms[1] >> 12), 0);
+++				IOLog("rootfind: fastpath RAMDisk1 -> md, pa %llx size %llx\n",
+++				    (uint64_t) ramdParms[0], (uint64_t) ramdParms[1]);
+++			}
+++			regEntry->release();
+++		}
+++		char rdFast[kMaxBootVar];
+++		if (PE_parse_boot_argn("rd", rdFast, sizeof(rdFast))
+++		    && rdFast[0] == 'm' && rdFast[1] == 'd' && rdFast[3] == 0) {
+++			int fxchar = rdFast[2];
+++			if (fxchar >= '0' && fxchar <= '9') {
+++				fxchar -= '0';
+++			} else {
+++				fxchar = fxchar & ~' ';
+++				fxchar = (fxchar >= 'A' && fxchar <= 'F') ? (fxchar & 0xF) + 9 : -1;
+++			}
+++			if (fxchar >= 0) {
+++				dev_t rddev = mdevlookup(fxchar);
+++				IOLog("rootfind: fastpath rd=md%c lookup -> %d\n", rdFast[2], (int) rddev);
+++				if (rddev >= 0) {
+++					rootName[0] = 'm';
+++					rootName[1] = 'd';
+++					rootName[2] = rdFast[2];
+++					rootName[3] = 0;
+++					*root = rddev;
+++					*oflags = 0;
+++					IOLog("BSD root: %s, major %d, minor %d (fastpath)\n",
+++					    rootName, major(*root), minor(*root));
+++					return kIOReturnSuccess;
+++				}
+++				panic("IOFindBSDRoot: rootfast md device not configured: %s", rdFast);
+++			}
+++		}
+++		IOLog("rootfind: fastpath found no rd=mdN, falling through\n");
+++	}
+++
++ 	// stall here for anyone matching on the IOBSD resource to finish (filesystems)
++ 	matching = IOService::serviceMatching(gIOResourcesKey);
+  	assert(matching);
+  	matching->setObject(gIOResourceMatchedKey, gIOBSDKey);
+  
+@@ -1699,10 +2016,26 @@ index 5219fb0d9ed6..29978e9cff43 100644
+  		OSSafeReleaseNULL(service);
+  	} else {
+  		IOLog("!BSD\n");
+-@@ -762,6 +769,17 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
++ 	}
+++	IOLog("rootfind: bsdwait done\n");
++ 	matching->release();
++ 	matching = NULL;
++ 
++@@ -706,6 +773,7 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
++ 	    && !PE_parse_boot_argn("rootdev", rdBootVar, kMaxBootVar )) {
++ 		rdBootVar[0] = 0;
++ 	}
+++	IOLog("rootfind: rdBootVar='%s'\n", rdBootVar[0] ? rdBootVar : "");
++ 
++ 	if ((regEntry = IORegistryEntry::fromPath( "/chosen", gIODTPlane ))) {
++ 		do {
++@@ -761,6 +829,19 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
++ 				}
+  #endif /* __LP64__ */
+  				(void)mdevadd(-1, ml_static_ptovirt(ramdParms[0]) >> 12, (unsigned int) (ramdParms[1] >> 12), 0);        /* Initialize it and pass back the device number */
+- 			}
+++				IOLog("rootfind: RAMDisk mdevadd done (pa %llx size %llx)\n",
+++				    (uint64_t) ramdParms[0], (uint64_t) ramdParms[1]);
+++			}
+ +			/*
+ +			 * A second image the loader may have left in memory (it becomes
+ +			 * /dev/md1): a volume for user space to mount, never the root.
+@@ -1713,10 +2046,25 @@ index 5219fb0d9ed6..29978e9cff43 100644
+ +				if (ramdParms[1] <= (((uint64_t)UINT_MAX) << 12)) {
+ +					(void)mdevadd(-1, ml_static_ptovirt(ramdParms[0]) >> 12, (unsigned int) (ramdParms[1] >> 12), 0);
+ +				}
+-+			}
++ 			}
+  			regEntry->release();                                                            /* Toss the entry */
+  		}
+- 	}
++@@ -786,6 +867,7 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
++ 		if (xchar >= 0) {                                                                                /* Do we have a valid memory device name? */
++ 			OSSafeReleaseNULL(matching);
++ 			*root = mdevlookup(xchar);                                                      /* Find the device number */
+++			IOLog("rootfind: rd=md%c lookup -> %d\n", dchar, (int) *root);
++ 			if (*root >= 0) {                                                                        /* Did we find one? */
++ 				rootName[0] = 'm';                                                              /* Build root name */
++ 				rootName[1] = 'd';                                                              /* Build root name */
++@@ -845,6 +927,7 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
++ 	if (!matching) {
++ 		OSString * astring;
++ 		// Match any HFS media
+++		IOLog("rootfind: no explicit root matched, trying IOMedia\n");
++ 
++ 		matching = IOService::serviceMatching( "IOMedia" );
++ 		assert(matching);
+ diff --git a/iokit/conf/files b/iokit/conf/files
+ index 5fb0a52062e0..6c430c2b23c7 100644
+ --- a/iokit/conf/files
+@@ -1878,7 +2226,7 @@ index 0316792a3f42..bbef0a4b26d4 100644
+  # Assume LTO scaling by default, unless it is being explicitly passed on the command-line
+  LARGE_BUILD_FOOTPRINT := $(if $(BUILD_LTO),$(BUILD_LTO),1)
+ diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+-index e26a1d70f470..f91095c98d26 100644
++index e26a1d70f470..512974b2fd83 100644
+ --- a/osfmk/arm/arm_init.c
+ +++ b/osfmk/arm/arm_init.c
+ @@ -73,6 +73,9 @@
+@@ -1891,47 +2239,69 @@ index e26a1d70f470..f91095c98d26 100644
+  
+  #include <console/serial_protos.h>
+  
+-@@ -335,7 +338,11 @@ arm_setup_pre_sign(void)
++@@ -335,7 +338,12 @@ arm_setup_pre_sign(void)
+   */
+  
+  __startup_func
+ +/* Bring-up checkpoints, see osfmk/arm64/loader_return.c */
+ +extern void loader_checkpoint(uint64_t n);
+++extern void loader_log_puts(const char *s);
+ +
+  void
+ +
+  arm_init(
+  	boot_args       *args)
+  {
+-@@ -354,6 +361,7 @@ arm_init(
++@@ -346,30 +354,46 @@ arm_init(
++ 	DTEntry chosen = NULL;
++ 	unsigned int dt_entry_size = 0;
++ 
+++	loader_log_puts("arm_init: entered\n");
++ 	arm_setup_pre_sign();
++-
+++	loader_log_puts("arm_init: pre_sign ok\n");
++ 	arm_slide_rebase_and_sign_image();
+++	loader_log_puts("arm_init: slide ok\n");
++ 
++ 	/* If kernel integrity is supported, use a constant copy of the boot args. */
+  	const_boot_args = *args;
+  	BootArgs = args = &const_boot_args;
+- 
++-
+++	loader_log_puts("arm_init: bootargs ok\n");
+++	loader_log_puts("arm_init: before ckpt10\n");
+ +	loader_checkpoint(10);
+++	loader_log_puts("arm_init: ckpt10 ok\n");
+  	cpu_data_init(&BootCpuData);
+  #if defined(HAS_APPLE_PAC)
+  	/* bootstrap cpu process dependent key for kernel has been loaded by start.s */
+-@@ -362,14 +370,19 @@ arm_init(
++ 	BootCpuData.rop_key = ml_default_rop_pid();
++ 	BootCpuData.jop_key = ml_default_jop_pid();
+  #endif /* defined(HAS_APPLE_PAC) */
+++	loader_log_puts("arm_init: cpu_data ok\n");
+  
+  	PE_init_platform(FALSE, args); /* Get platform expert set up */
+++	loader_log_puts("arm_init: PE_init_platform ok\n");
+ +	loader_checkpoint(11);
+  
+  #if __arm64__
+  	configure_timer_apple_regs();
+++	loader_log_puts("arm_init: timer_regs ok\n");
+ +	loader_checkpoint(30);
+  	wfe_timeout_configure();
+++	loader_log_puts("arm_init: wfe_cfg ok\n");
+ +	loader_checkpoint(31);
+  	wfe_timeout_init();
+++	loader_log_puts("arm_init: wfe_init ok\n");
+ +	loader_checkpoint(32);
+  
+  	configure_misc_apple_boot_args();
+  	configure_misc_apple_regs();
+++	loader_log_puts("arm_init: misc ok\n");
+ +	loader_checkpoint(33);
+  
+  #if (DEVELOPMENT || DEBUG)
+  	unsigned long const *platform_stall_ptr = NULL;
+-@@ -385,6 +398,7 @@ arm_init(
++@@ -385,11 +409,13 @@ arm_init(
+  	}
+  
+  	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_ARM_INIT);
+@@ -1939,95 +2309,182 @@ index e26a1d70f470..f91095c98d26 100644
+  
+  	chosen = NULL; // Force a re-lookup later on since VM addresses are not final at this point
+  	dt_entry_size = 0;
+-@@ -422,10 +436,13 @@ arm_init(
++ #endif
++ 
+++	loader_log_puts("arm_init: stall ok\n");
++ 
++ 	{
++ 		/*
++@@ -422,11 +448,17 @@ arm_init(
+  	}
+  #endif
+  
+++	loader_log_puts("arm_init: pageshift ok\n");
+ +	loader_checkpoint(35);
+  	ml_parse_cpu_topology();
+++	loader_log_puts("arm_init: topology ok\n");
+ +	loader_checkpoint(12);
+  
+  
+  	master_cpu = ml_get_boot_cpu_number();
+ +	loader_checkpoint(40);
+  	assert(master_cpu >= 0 && master_cpu <= ml_get_max_cpu_number());
+++	loader_log_puts("arm_init: master_cpu ok\n");
+  
+  	BootCpuData.cpu_number = (unsigned short)master_cpu;
+-@@ -439,11 +456,14 @@ arm_init(
++ 	BootCpuData.intstack_top = (vm_offset_t) &intstack_top;
++@@ -439,11 +471,17 @@ arm_init(
+  	CpuDataEntries[master_cpu].cpu_data_paddr = (void *)((uintptr_t)(args->physBase)
+  	    + ((uintptr_t)&BootCpuData
+  	    - (uintptr_t)(args->virtBase)));
+ +	loader_checkpoint(41);
+++	loader_log_puts("arm_init: cpuentries ok\n");
+  
+  	thread = thread_bootstrap();
+ +	loader_checkpoint(42);
+++	loader_log_puts("arm_init: threadboot ok\n");
+  	thread->machine.CpuDatap = &BootCpuData;
+  	thread->machine.pcpu_data_base = (vm_offset_t)0;
+  	machine_set_current_thread(thread);
+ +	loader_checkpoint(43);
+++	loader_log_puts("arm_init: curthread ok\n");
+  
+  	/*
+  	 * Preemption is enabled for this thread so that it can lock mutexes without
+-@@ -452,12 +472,16 @@ arm_init(
++@@ -452,21 +490,33 @@ arm_init(
+  	 * preemption level is not really meaningful for the bootstrap thread.
+  	 */
+  	thread->machine.preemption_count = 0;
+ +	loader_checkpoint(44);
+++	loader_log_puts("arm_init: preempt ok\n");
+  	cpu_bootstrap();
+++	loader_log_puts("arm_init: cpu_bootstrap ok\n");
+ +	loader_checkpoint(13);
+  
+  	rtclock_early_init();
+++	loader_log_puts("arm_init: rtclock ok\n");
+ +	loader_checkpoint(14);
+  
+  	kernel_debug_string_early("kernel_startup_bootstrap");
+  	kernel_startup_bootstrap();
+++	loader_log_puts("arm_init: startupboot ok\n");
+ +	loader_checkpoint(15);
+  
+  	/*
+  	 * Initialize the timer callout world
+-@@ -465,6 +489,7 @@ arm_init(
++ 	 */
+  	timer_call_init();
+++	loader_log_puts("arm_init: timercall ok\n");
+  
+  	cpu_init();
+++	loader_log_puts("arm_init: cpuinit ok\n");
+ +	loader_checkpoint(16);
+  
+  	processor_bootstrap();
+++	loader_log_puts("arm_init: probootstrap ok\n");
++ 
++ 	if (PE_parse_boot_argn("maxmem", &maxmem, sizeof(maxmem))) {
++ 		xmaxmem = (uint64_t) maxmem * (1024 * 1024);
++@@ -475,6 +525,7 @@ arm_init(
++ 	} else {
++ 		xmaxmem = 0;
++ 	}
+++	loader_log_puts("arm_init: maxmem ok\n");
+  
+-@@ -514,6 +539,7 @@ arm_init(
++ #if SCHED_HYGIENE_DEBUG
++ 	{
++@@ -513,7 +564,10 @@ arm_init(
++ 	__builtin_arm_wsr("pan", 1);
+  #endif  /* __ARM_PAN_AVAILABLE__ */
+  
+++	loader_log_puts("arm_init: pre_vm ok\n");
+  	arm_vm_init(xmaxmem, args);
+++	loader_log_puts("arm_init: vm_init ok\n");
+ +	loader_checkpoint(17);
+  
+  	if (debug_boot_arg) {
+  		patch_low_glo();
+-@@ -527,7 +553,9 @@ arm_init(
++@@ -527,8 +581,13 @@ arm_init(
+  
+  	/* Setup debugging output. */
+  	const unsigned int serial_exists = serial_init();
+++	loader_log_puts("arm_init: serial ok\n");
+ +	loader_checkpoint(18);
+  	kernel_startup_initialize_upto(STARTUP_SUB_KPRINTF);
+++	loader_log_puts("arm_init: kprintf_up ok\n");
+ +	loader_checkpoint(19);
+  	kprintf("kprintf initialized\n");
+++	loader_log_puts("arm_init: kprintf0 ok\n");
+  
+  	serialmode = 0;
+-@@ -569,6 +597,7 @@ arm_init(
++ 	if (PE_parse_boot_argn("serial", &serialmode, sizeof(serialmode))) {
++@@ -569,9 +628,12 @@ arm_init(
+  		disableConsoleOutput = FALSE;     /* Allow printfs to happen */
+  	}
+  	PE_create_console();
+++	loader_log_puts("arm_init: console ok\n");
+ +	loader_checkpoint(20);
+  
+  	/* setup console output */
+  	PE_init_printf(FALSE);
+-@@ -647,6 +676,7 @@ arm_init(
+++	loader_log_puts("arm_init: printf ok\n");
++ 
++ #if __arm64__
++ #if DEBUG
++@@ -580,8 +642,10 @@ arm_init(
++ #endif
++ 
++ 	cpu_machine_idle_init(TRUE);
+++	loader_log_puts("arm_init: idleinit ok\n");
++ 
++ 	PE_init_platform(TRUE, &BootCpuData);
+++	loader_log_puts("arm_init: platform2 ok\n");
++ 
++ #if __arm64__
++ 	extern bool cpu_config_correct;
++@@ -590,6 +654,7 @@ arm_init(
++ 	}
++ 
++ 	ml_map_cpu_pio();
+++	loader_log_puts("arm_init: cpupio ok\n");
++ 
++ #if APPLE_ARM64_ARCH_FAMILY
++ 	configure_late_apple_regs();
++@@ -598,7 +663,7 @@ arm_init(
++ #endif
++ 
++ 	cpu_timebase_init(TRUE);
++-
+++	loader_log_puts("arm_init: timebase ok\n");
++ #if KPERF
++ 	/* kptimer_curcpu_up() must be called after cpu_timebase_init */
++ 	kptimer_curcpu_up();
++@@ -606,6 +671,7 @@ arm_init(
++ 
++ 	PE_init_cpu();
++ 	fiq_context_init(TRUE);
+++	loader_log_puts("arm_init: fiq ok\n");
++ 
++ 
++ #if HIBERNATION
++@@ -634,6 +700,7 @@ arm_init(
++ 
++ 	gDramBase = *dram_base;
++ 	gDramSize = *dram_size;
+++	loader_log_puts("arm_init: dram ok\n");
++ 
++ 	/*
++ 	 * Initialize the stack protector for all future calls
++@@ -647,6 +714,8 @@ arm_init(
+  	 * against string vulnerabilities
+  	 */
+  	__stack_chk_guard &= ~(0xFFULL << 8);
+ +	loader_checkpoint(21);
+++	loader_log_puts("arm_init: schk ok\n");
+  	machine_startup(args);
+  }
+  
+-@@ -673,6 +703,9 @@ arm_init_cpu(
++@@ -673,6 +742,9 @@ arm_init_cpu(
+  
+  
+  	machine_set_current_thread(cpu_data_ptr->cpu_active_thread);
+@@ -2147,6 +2604,34 @@ index df672c65b144..d7e1da7c5db2 100644
+  #endif /* HAS_APPLE_PAC */
+  
+  	bool reserved11;
++diff --git a/osfmk/arm/rtclock.c b/osfmk/arm/rtclock.c
++index 5989b4833493..30213ddc10d3 100644
++--- a/osfmk/arm/rtclock.c
+++++ b/osfmk/arm/rtclock.c
++@@ -117,6 +117,10 @@ timebase_callback(struct timebase_freq_t * freq)
++ 
++ 	denom = freq->timebase_num;
++ 	numer = freq->timebase_den * NSEC_PER_SEC;
+++	/*
+++	 * No printf here: this callback runs before kernel_startup_bootstrap has
+++	 * initialized the doprnt/console locks (their lock words are still zero).
+++	 */
++ 	// reduce by the greatest common denominator to minimize overflow
++ 	if (numer > denom) {
++ 		t64_1 = numer;
++@@ -141,6 +145,12 @@ timebase_callback(struct timebase_freq_t * freq)
++ 	rtclock_usec_divisor = divisor / USEC_PER_SEC;
++ }
++ 
+++int
+++rtclock_get_timer_cnt(void)
+++{
+++	return getCpuDatap()->cpu_stat.timer_cnt;
+++}
+++
++ /*
++  * Initialize the system clock device for the current cpu
++  */
+ diff --git a/osfmk/arm64/corecrypto/arm64_isa_compatibility.h b/osfmk/arm64/corecrypto/arm64_isa_compatibility.h
+ index b9549da357b4..cca31ea32502 100644
+ --- a/osfmk/arm64/corecrypto/arm64_isa_compatibility.h
+@@ -2179,7 +2664,7 @@ index 94e91306b143..0ec1323086b7 100644
+  #endif
+  
+ diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+-index e76e7e70ab9c..4f540f8caf43 100644
++index e76e7e70ab9c..90c9b4c72d24 100644
+ --- a/osfmk/arm64/machine_routines.c
+ +++ b/osfmk/arm64/machine_routines.c
+ @@ -734,6 +734,9 @@ ml_get_machine_mem(void)
+@@ -2365,10 +2850,75 @@ index e76e7e70ab9c..4f540f8caf43 100644
+  
+  	*processor_out = processor;
+  	*ipi_handler_out = cpu_signal_handler;
+-@@ -2237,8 +2350,16 @@ _enable_virtual_timer(void)
++@@ -2024,6 +2137,34 @@ ml_set_decrementer(uint32_t dec_value)
++ 	assert(ml_get_interrupts_enabled() == FALSE);
++ 	cdp->cpu_decrementer = dec_value;
++ 
+++	{
+++		static int logged;
+++		if (!logged) {
+++			logged = 1;
+++			extern void loader_log_puts(const char *s);
+++			uint64_t tval = __builtin_arm_rsr64("CNTV_TVAL_EL0");
+++			char b[64];
+++			const char *d = "0123456789abcdef";
+++			char *p = b;
+++			const char *pre = "tmr: set_dec w=";
+++			for (const char *l = pre; *l; ) {
+++				*p++ = *l++;
+++			}
+++			for (int sh = 28; sh >= 0; sh -= 4) {
+++				*p++ = d[(dec_value >> sh) & 0xF];
+++			}
+++			for (const char *l = " rd="; *l; ) {
+++				*p++ = *l++;
+++			}
+++			for (int sh = 60; sh >= 0; sh -= 4) {
+++				*p++ = d[(tval >> sh) & 0xF];
+++			}
+++			*p++ = '\n';
+++			*p = 0;
+++			loader_log_puts(b);
+++		}
+++	}
+++
++ 	if (cdp->cpu_set_decrementer_func) {
++ 		cdp->cpu_set_decrementer_func(dec_value);
++ 	} else {
++@@ -2237,8 +2378,46 @@ _enable_virtual_timer(void)
+  	uint64_t cntvctl = CNTV_CTL_EL0_ENABLE; /* One wants to use 32 bits, but "mrs" prefers it this way */
+  
+  	__builtin_arm_wsr64("CNTV_CTL_EL0", cntvctl);
+++	{
+++		/*
+++		 * Read back what the hardware (or the hypervisor) now reports. If Qualcomm's
+++		 * hypervisor traps these registers without emulating them, the enable never
+++		 * sticks and the kernel waits for an interrupt that cannot happen.
+++		 */
+++		extern void loader_log_puts(const char *s);
+++		uint64_t ctl = __builtin_arm_rsr64("CNTV_CTL_EL0");
+++		uint64_t frq = __builtin_arm_rsr64("CNTFRQ_EL0");
+++		char b[96];
+++		char *p = b;
+++
+++		*p++ = 't'; *p++ = 'm'; *p++ = 'r'; *p++ = ':';
+++		p = b + __builtin_strlen(b);
+++		/* manual hex: ctl, frq */
+++		const char *d = "0123456789abcdef";
+++		const char *lbl[2] = { " ctl=", " frq=" };
+++		uint64_t vals[2] = { ctl, frq };
+++		for (int i = 0; i < 2; i++) {
+++			for (const char *l = lbl[i]; *l; ) {
+++				*p++ = *l++;
+++			}
+++			for (int sh = 60; sh >= 0; sh -= 4) {
+++				*p++ = d[(vals[i] >> sh) & 0xF];
+++			}
+++		}
+++		*p++ = '\n';
+++		*p = 0;
+++		loader_log_puts(b);
+++	}
+ +#if defined(APPLE_ARM64_ARCH_FAMILY)
+  	/* disable the physical timer as a precaution, as its registers reset to architecturally unknown values */
+  	__builtin_arm_wsr64("CNTP_CTL_EL0", CNTP_CTL_EL0_IMASKED);
+@@ -2382,6 +2932,44 @@ index e76e7e70ab9c..4f540f8caf43 100644
+  }
+  
+  void
++diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
++index 2cc442e05791..aff969f22290 100644
++--- a/osfmk/arm64/sleh.c
+++++ b/osfmk/arm64/sleh.c
++@@ -1879,6 +1879,15 @@ void
++ sleh_fiq(arm_saved_state_t *state)
++ {
++ 	unsigned int type   = DBG_INTR_TYPE_UNKNOWN;
+++	{
+++		static unsigned fiq_dbg_count;
+++		extern void loader_log_hex(const char *prefix, uint64_t value);
+++
+++		if (fiq_dbg_count < 6) {
+++			fiq_dbg_count++;
+++			loader_log_hex("fiq: entered, type ", type);
+++		}
+++	}
++ #if MACH_ASSERT
++ 	int preemption_level = sleh_get_preemption_level();
++ #endif
++@@ -1983,6 +1992,17 @@ sleh_serror(arm_context_t *context, uint32_t esr, vm_offset_t far)
++ {
++ 	task_vtimer_check(current_thread());
++ 
+++	{
+++		static unsigned serr_dbg_count;
+++		extern void loader_log_hex(const char *prefix, uint64_t value);
+++
+++		if (serr_dbg_count < 6) {
+++			serr_dbg_count++;
+++			loader_log_hex("serror: esr ", esr);
+++			loader_log_hex("serror: far ", far);
+++		}
+++	}
+++
++ 	KDBG_RELEASE(MACHDBG_CODE(DBG_MACH_EXCP_SERR_ARM, 0) | DBG_FUNC_START,
++ 	    esr, VM_KERNEL_ADDRHIDE(far));
++ 	arm_saved_state_t *state = &context->ss;
+ diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+ index e5336e5a1cce..a54e35035cde 100644
+ --- a/osfmk/arm64/start.s
+@@ -2753,6 +3341,24 @@ index c40d57bcc677..1b7a1fcdfcdf 100644
+ +osfmk/arm64/user_exception_trace.c	standard
+ +osfmk/arm64/gic_v3_irq.c	optional nos_arm_asm
+ +osfmk/arm64/psci_smp.c	optional nos_arm_asm
++diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
++index e5b23f2a2fbf..54e37dd28523 100644
++--- a/osfmk/console/serial_console.c
+++++ b/osfmk/console/serial_console.c
++@@ -254,6 +254,13 @@ _cnputc(char c, bool poll)
++ 		_cnputc('\r', poll);
++ 	}
++ 
+++	/* bring-up: mirror console text into the loader log ring */
+++	{
+++		extern void loader_log_putc(char c);
+++
+++		loader_log_putc(c);
+++	}
+++
++ 	cons_ops[idx].putc(c, poll);
++ }
++ 
+ diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
+ index 384118e8d7a9..2573d2ebd4e6 100644
+ --- a/osfmk/console/video_console.c
+@@ -3008,7 +3614,7 @@ index 8e29586464de..0a7de6fc4be7 100644
+  				if (idle_reason == 0) {
+  					idle_reason = 4;
+ diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+-index bec97fbf7243..203e1f48783f 100644
++index bec97fbf7243..05478e02658e 100644
+ --- a/osfmk/kern/startup.c
+ +++ b/osfmk/kern/startup.c
+ @@ -156,6 +156,7 @@
+@@ -3019,7 +3625,162 @@ index bec97fbf7243..203e1f48783f 100644
+  #endif
+  #endif
+  
+-@@ -721,6 +722,9 @@ kernel_bootstrap_thread(void)
++@@ -218,6 +219,9 @@ extern int serverperfmode;
++ 
++ TUNABLE(startup_debug_t, startup_debug, "startup_debug", 0);
++ 
+++/* Bring-up probes: direct writes into the loader log ring (see osfmk/arm64/loader_return.c) */
+++extern void loader_log_puts(const char *s);
+++
++ static inline void
++ kernel_bootstrap_log(const char *message)
++ {
++@@ -427,11 +431,14 @@ kernel_bootstrap(void)
++ 	char            namep[16];
++ 
++ 	printf("%s\n", version); /* log kernel version */
+++	loader_log_puts("kb: version ok\n");
++ 
++ 	scale_setup();
+++	loader_log_puts("kb: scale ok\n");
++ 
++ 	kernel_bootstrap_log("vm_mem_bootstrap");
++ 	vm_mem_bootstrap();
+++	loader_log_puts("kb: vmmem ok\n");
++ 
++ 	machine_info.memory_size = (uint32_t)mem_size;
++ #if XNU_TARGET_OS_OSX
++@@ -476,12 +483,14 @@ kernel_bootstrap(void)
++ 
++ 	kernel_bootstrap_log("console_init");
++ 	console_init();
+++	loader_log_puts("kb: console_init ok\n");
++ 
++ 	kernel_bootstrap_log("stackshot_init");
++ 	stackshot_init();
++ 
++ 	kernel_bootstrap_log("sched_init");
++ 	sched_init();
+++	loader_log_puts("kb: sched ok\n");
++ 
++ #if CONFIG_MACF
++ 	kernel_bootstrap_log("mac_policy_init");
++@@ -496,18 +505,21 @@ kernel_bootstrap(void)
++ 	 */
++ 	kernel_bootstrap_log("PMAP_ACTIVATE_KERNEL");
++ 	PMAP_ACTIVATE_KERNEL(master_cpu);
+++	loader_log_puts("kb: pmapact ok\n");
++ 
++ 	kernel_bootstrap_log("mapping_free_prime");
++ 	mapping_free_prime();                                           /* Load up with temporary mapping blocks */
++ 
++ 	kernel_bootstrap_log("machine_init");
++ 	machine_init();
+++	loader_log_puts("kb: machine_init ok\n");
++ 
++ 	kernel_bootstrap_log("thread_machine_init_template");
++ 	thread_machine_init_template();
++ 
++ 	kernel_bootstrap_log("clock_init");
++ 	clock_init();
+++	loader_log_puts("kb: clock_init ok\n");
++ 
++ 	/*
++ 	 *	Initialize the IPC, task, and thread subsystems.
++@@ -528,9 +540,11 @@ kernel_bootstrap(void)
++ 
++ 	kernel_bootstrap_log("task_init");
++ 	task_init();
+++	loader_log_puts("kb: task ok\n");
++ 
++ 	kernel_bootstrap_log("thread_init");
++ 	thread_init();
+++	loader_log_puts("kb: thread ok\n");
++ 
++ 	kernel_bootstrap_log("restartable_init");
++ 	restartable_init();
++@@ -597,12 +611,14 @@ kernel_bootstrap_thread(void)
++ #if (DEVELOPMENT || DEBUG)
++ 	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_KERNEL_BOOTSTRAP);
++ #endif
+++	loader_log_puts("kbt: entered\n");
++ 
++ 	kernel_bootstrap_thread_log("idle_thread_create");
++ 	/*
++ 	 * Create the idle processor thread.
++ 	 */
++ 	idle_thread_create(processor);
+++	loader_log_puts("kbt: idle ok\n");
++ 
++ 	/*
++ 	 * N.B. Do not stick anything else
++@@ -612,12 +628,14 @@ kernel_bootstrap_thread(void)
++ 	 */
++ 	kernel_bootstrap_thread_log("sched_startup");
++ 	sched_startup();
+++	loader_log_puts("kbt: sched_startup ok\n");
++ 
++ 	/*
++ 	 * Thread lifecycle maintenance (teardown, stack allocation)
++ 	 */
++ 	kernel_bootstrap_thread_log("thread_daemon_init");
++ 	thread_daemon_init();
+++	loader_log_puts("kbt: thread_daemon ok\n");
++ 
++ 	/*
++ 	 * Thread callout service.
++@@ -630,18 +648,21 @@ kernel_bootstrap_thread(void)
++ 	 */
++ 	kernel_bootstrap_thread_log("thread_bind");
++ 	thread_bind(processor);
+++	loader_log_puts("kbt: thread_bind ok\n");
++ 
++ 	/*
++ 	 * Kick off memory mapping adjustments.
++ 	 */
++ 	kernel_bootstrap_thread_log("mapping_adjust");
++ 	mapping_adjust();
+++	loader_log_puts("kbt: mapping_adjust ok\n");
++ 
++ 	/*
++ 	 *	Create the clock service.
++ 	 */
++ 	kernel_bootstrap_thread_log("clock_service_create");
++ 	clock_service_create();
+++	loader_log_puts("kbt: clock_service ok\n");
++ 
++ 	/*
++ 	 *	Create the device service.
++@@ -696,23 +717,28 @@ kernel_bootstrap_thread(void)
++ 	 * interrupts or preemption enabled may begin enforcement.
++ 	 */
++ 	kernel_startup_initialize_upto(STARTUP_SUB_EARLY_BOOT);
+++	loader_log_puts("kbt: early_boot ok\n");
++ 
++ #if SCHED_HYGIENE_DEBUG
++ 	// Reset interrupts masked timeout before we enable interrupts
++ 	ml_spin_debug_clear_self();
++ #endif
+++	loader_log_puts("kbt: pre_spllo\n");
++ 	(void) spllo();         /* Allow interruptions */
+++	loader_log_puts("kbt: post_spllo\n");
++ 
++ 	/*
++ 	 * This will start displaying progress to the user, start as early as possible
++ 	 */
++ 	initialize_screen(NULL, kPEAcquireScreen);
+++	loader_log_puts("kbt: screen ok\n");
++ 
++ 	/*
++ 	 *	Initialize the shared region module.
++ 	 */
++ 	vm_commpage_init();
++ 	vm_commpage_text_init();
+++	loader_log_puts("kbt: commpage ok\n");
++ 
++ #if CONFIG_MACF
++ 	kernel_bootstrap_log("mac_policy_initmach");
++@@ -721,13 +747,18 @@ kernel_bootstrap_thread(void)
+  	kernel_bootstrap_log("vnguard_policy_init");
+  	vnguard_policy_init();
+  #endif
+@@ -3027,8 +3788,63 @@ index bec97fbf7243..203e1f48783f 100644
+ +	kernel_bootstrap_log("minimac_policy_init");
+ +	minimac_policy_init();
+  #endif
+++	loader_log_puts("kbt: mac ok\n");
+  
+  #if CONFIG_DTRACE
++ 	kernel_bootstrap_log("dtrace_early_init");
++ 	dtrace_early_init();
++ 	sdt_early_init();
++ #endif
+++	loader_log_puts("kbt: dtrace ok\n");
++ 
++ #if CODE_SIGNING_MONITOR
++ 	kernel_bootstrap_log("provisioning_profile_init");
++@@ -754,10 +785,12 @@ kernel_bootstrap_thread(void)
++ 	 */
++ 	kernel_bootstrap_log("OSKextRemoveKextBootstrap");
++ 	OSKextRemoveKextBootstrap();
+++	loader_log_puts("kbt: kextboot ok\n");
++ 
++ 	/* No changes to kernel text and rodata beyond this point. */
++ 	kernel_bootstrap_log("machine_lockdown");
++ 	machine_lockdown();
+++	loader_log_puts("kbt: lockdown ok\n");
++ 
++ #ifdef CONFIG_XNUPOST
++ 	kern_return_t result = kernel_list_tests();
++@@ -772,6 +805,7 @@ kernel_bootstrap_thread(void)
++ 	kernel_bootstrap_log("PE_lockdown_iokit");
++ 	PE_lockdown_iokit();
++ #endif
+++	loader_log_puts("kbt: iokit_lock ok\n");
++ 	/*
++ 	 * max_cpus must be nailed down by the time PE_lockdown_iokit() finishes,
++ 	 * at the latest
++@@ -782,13 +816,16 @@ kernel_bootstrap_thread(void)
++ #if KPERF
++ 	kperf_init_early();
++ #endif
+++	loader_log_puts("kbt: kperf ok\n");
++ 
++ 	/*
++ 	 *	Start the user bootstrap.
++ 	 */
++ #ifdef  MACH_BSD
+++	loader_log_puts("kbt: pre_bsd\n");
++ 	bsd_init();
++ #endif
+++	loader_log_puts("kbt: bsd ok\n");
++ 
++ 
++ 	/*
++@@ -812,6 +849,7 @@ kernel_bootstrap_thread(void)
++ 	/*
++ 	 *	Become the pageout daemon.
++ 	 */
+++	loader_log_puts("kbt: pre_pageout\n");
++ 	vm_pageout();
++ 	/*NOTREACHED*/
++ }
+ diff --git a/osfmk/kern/thread.c b/osfmk/kern/thread.c
+ index 384ef23fe0e1..d5ab6db0edbc 100644
+ --- a/osfmk/kern/thread.c
+@@ -3117,7 +3933,7 @@ index 3ad743fc3efb..ce036c5a2c26 100644
+  void
+  pe_init_fiq()
+ diff --git a/pexpert/arm/pe_kprintf.c b/pexpert/arm/pe_kprintf.c
+-index 65144c74239c..ab6260d52d84 100644
++index 65144c74239c..f1a6c65d1d66 100644
+ --- a/pexpert/arm/pe_kprintf.c
+ +++ b/pexpert/arm/pe_kprintf.c
+ @@ -29,6 +29,7 @@ SECURITY_READ_ONLY_LATE(bool) enable_dklog_serial_output = false;
+@@ -3128,6 +3944,24 @@ index 65144c74239c..ab6260d52d84 100644
+  
+  __startup_func
+  static void
++@@ -61,12 +62,12 @@ PE_init_kprintf(void)
++ 	if (serial_init()) {
++ 		PE_kputc = serial_putc_crlf;
++ 	} else {
++-		/**
++-		 * If serial failed to initialize then fall back to using the console,
++-		 * and assume the console is using the video console (because clearly
++-		 * serial doesn't work).
+++		/*
+++		 * No serial (enchilada: no PL011, and the SDM845 uart is a geni engine the
+++		 * PL011 routines cannot drive). The loader's log ring is the console: the
+++		 * loader prints it on the screen and hands it to the host over USB.
++ 		 */
++-		PE_kputc = console_write_unbuffered;
+++		PE_kputc = loader_log_putc;
++ 	}
++ }
++ STARTUP(KPRINTF, STARTUP_RANK_FIRST, PE_init_kprintf);
+ @@ -159,6 +160,7 @@ serial_putc_crlf(char c)
+  	if (c == '\n') {
+  		uart_putc('\r');
+diff --git a/xnuloader/loader.c b/xnuloader/loader.c
+index 640b05d..8e971ef 100644
+--- a/xnuloader/loader.c
++++ b/xnuloader/loader.c
+@@ -553,6 +553,20 @@ static const struct platform platform_redwood = {
+ 	.fb_base = 0xE1000000,
+ };
+ 
++static const struct platform platform_enchilada = {
++	/* OnePlus 6 (SDM845): peripherals 0x00400000 (QUP) through the GPU wrappers, GICv3 at 0x17a00000. */
++	.name = "enchilada", .io_base = 0x00400000, .io_size = 0x3FC00000,
++	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .log_other_cpu = 1,
++	.cores = 8, .core_shift = 8,
++	/*
++	 * 4x Kryo 385 Gold (2.8 GHz) + 4x Silver (1.77 GHz), all Cortex-A75: the device tree has no
++	 * "small-core" marks, so the kernel schedules them equally; the Silver cluster only clocks lower.
++	 */
++	.small_cores = 0x0,
++	.fb_base = 0x9D400000,          /* the GOP base the enchilada UEFI printed on first boot ("display 1080 x 2280 at 9d400000");
++	                                   the DTB's cont_splash_region@9d400000, same value: the splash framebuffer */
++};
++
+ /*
+  * The devices the loader knows, told apart by the framebuffer base their UEFI reports. A port to another
+  * device adds its description here (common/new-device.sh writes a starting point, docs/PORTING.md says
+@@ -560,6 +574,7 @@ static const struct platform platform_redwood = {
+  */
+ static const struct platform *const platforms[] = {
+ 	&platform_redwood,
++	&platform_enchilada,
+ };
+ 
+ /* ------------------------------------------------------------------------ */
+@@ -770,6 +785,7 @@ volatile uint64_t other_cpu_done __attribute__((aligned(64)));   /* 1: the kerne
+ uint64_t psci_by_hvc __attribute__((aligned(64)));
+ void other_cpu_entry(void);
+ void other_cpu_return_stub(void);
++void psci_probe_entry(void);
+ 
+ __asm__ (
+         ".text\n"
+@@ -2247,6 +2263,68 @@ psci_call(uint64_t function, uint64_t a1, uint64_t a2, uint64_t a3)
+ 	return status;
+ }
+ 
++/*
++ * What a core does when it is started only to be asked whether it could be
++ * started (core_really_usable): turns itself off again, at once.
++ */
++__asm__ (
++        ".text\n"
++        ".balign 64\n"
++        ".globl psci_probe_entry\n"
++        "psci_probe_entry:\n"                   /* MMU and caches are off */
++        "  msr daifset, #0xf\n"
++        "  mrs x9, sctlr_el1\n"
++        "  bic x9, x9, #0x1\n"
++        "  bic x9, x9, #0x4\n"
++        "  bic x9, x9, #0x1000\n"
++        "  msr sctlr_el1, x9\n"
++        "  isb\n"
++        "  adrp x10, psci_by_hvc\n"
++        "  add  x10, x10, :lo12:psci_by_hvc\n"
++        "  ldr x9, [x10]\n"
++        "  mov x0, #0x0002\n"                   /* PSCI CPU_OFF: does not return */
++        "  movk x0, #0x8400, lsl #16\n"
++        "  cbnz x9, 2f\n"
++        "  smc #0\n"
++        "1: wfi\n"
++        "  b 1b\n"
++        "2: hvc #0\n"
++        "  b 1b\n"
++        );
++
++/*
++ * The firmware's AFFINITY_INFO does not tell the whole truth: a core that
++ * UEFI runs something on can answer "off" and still refuse PSCI_CPU_ON with
++ * DENIED -- on the enchilada the answer varies from boot to boot. Every core
++ * is therefore asked for real: started into a stub that turns itself off.
++ * Returns whether the core is the kernel's to take.
++ */
++static int
++core_really_usable(uint64_t mpidr)
++{
++	int64_t status;
++
++	print("probing core %x\n", mpidr);
++	psci_by_hvc = PLAT->psci_hvc;
++	clean_dcache((uint64_t)(uintptr_t)&psci_by_hvc, (uint64_t)(uintptr_t)&psci_by_hvc + 8);
++	status = psci_call(PSCI_CPU_ON, mpidr, (uint64_t)(uintptr_t)&psci_probe_entry, 0);
++	print("probe cpu_on %x -> %d\n", mpidr, (uint64_t)status);
++	if (status != 0) {
++		return 0;               /* refused: the firmware runs something on it (or will not have it at all) */
++	}
++	for (int i = 0; i < 50; i++) {  /* it turns itself off; it should say so within 5 ms */
++		int64_t state = psci_call(PSCI_AFFINITY_INFO, mpidr, 0, 0);
++
++		if (state == 1 || state == PSCI_NOT_SUPPORTED) {
++			print("core %x: probe ok\n", mpidr);
++			return 1;
++		}
++		BS->stall(100);         /* 100 us */
++	}
++	print("core %x was started but did not turn itself off\n", mpidr);
++	return 0;
++}
++
+ /*
+  * Run the kernel on the core with that MPIDR and wait until it is back. Returns 0 when it has
+  * been and gone (the caller goes on as after loader_return_stub), a negative number if the
+@@ -2283,9 +2361,11 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
+ 
+ 	started = last_pet = last_battery = last_beat_at = READ_SYSREG(CNTVCT_EL0);
+ 	print("core %x: the firmware answers %d to the request to start it\n", mpidr, (uint64_t)status);
+-	if (PLAT->log_other_cpu) {
+-		flush_log();
+-	}
++	/*
++	 * No writes to storage from here on: the kernel's own drivers take the UFS over as it starts
++	 * (on the enchilada a fourth logdump write through the now-dead host controller crashed with
++	 * a wild DMA address), so the log only lives in memory until the kernel is back.
++	 */
+ 	while (status == 0) {
+ 		/*
+ 		 * The first seconds are the ones in which a new arrangement goes wrong, and a machine
+@@ -2301,7 +2381,7 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
+ 				} else {
+ 					note_kernel_progress(live, slide, noted);
+ 				}
+-				flush_log();
++				/* no flush_log here: it writes storage, and the kernel owns that now */
+ 			}
+ 		}
+ 		/*
+@@ -3027,6 +3107,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+ 	const struct platform *plat = PLAT;
+ 	struct dt_writer w = { .base = (uint8_t *)dt_pa, .cur = (uint8_t *)dt_pa, .depth = 0 };
+ 	uint64_t cntfrq = READ_SYSREG(CNTFRQ_EL0);
++	print("CNTFRQ=%x CNTVCT now=%x\n", cntfrq, READ_SYSREG(CNTVCT_EL0));
+ 	uint64_t ranges[3] = { 0, plat->io_base, plat->io_size };
+ 	uint64_t reg2[2];
+ 	uint8_t seed[64];
+@@ -3181,6 +3262,17 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+ 	uint64_t cpu_mpidr[8] = { kernel_mpidr };
+ 	int cpu_count = 1, boot_core = (int)(kernel_mpidr >> plat->core_shift);
+ 
++	/*
++	 * The boot core is asked for real first (core_really_usable): if the firmware will
++	 * not have it (DENIED, whatever AFFINITY_INFO answered), the kernel boots on the
++	 * nearest core it will start, and bootcpu= in the kernel's arguments is corrected
++	 * to match (the kernel's return path and the device tree are built from it).
++	 */
++	print("BEFORE-PROBE kernel=%x this=%x\n", kernel_mpidr, this_mpidr);
++	if (kernel_mpidr != this_mpidr && !core_really_usable(kernel_mpidr)) {
++		print("core %x answers to AFFINITY_INFO but refuses to be started: taking another\n", kernel_mpidr);
++		kernel_mpidr = 0;
++	}
+ 	if (more_cores) {
+ 		for (int distance = 1; distance < plat->cores; distance++) {
+ 			for (int side = 0; side < 2; side++) {
+@@ -3191,9 +3283,35 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+ 				if (core < 0 || core >= plat->cores || mpidr == this_mpidr) {
+ 					continue;
+ 				}
++				if (mpidr == kernel_mpidr) {
++					continue;           /* the boot core, already chosen and probed */
++				}
+ 				state = psci_call(PSCI_AFFINITY_INFO, mpidr, 0, 0);
+ 				if (state == 1 || state == PSCI_NOT_SUPPORTED) {
+-					cpu_mpidr[cpu_count++] = mpidr;
++					if (core_really_usable(mpidr)) {
++						if (kernel_mpidr == 0) {
++							char *cc;
++							int boot_arg_at = 0;
++
++							kernel_mpidr = mpidr;
++							boot_core = core;
++							cpu_mpidr[0] = mpidr;
++							for (cc = pi.cmdline; *cc; cc++) {
++								if (cc[0] == 'b' && starts_with(cc, "bootcpu=") &&
++								    (cc == pi.cmdline || cc[-1] == ' ') && cc[8] >= '0' && cc[8] <= '7') {
++									cc[8] = (char)('0' + core);
++									boot_arg_at = 1;
++									break;
++								}
++							}
++							print("the kernel will boot on core %x instead%s\n", mpidr,
++							    boot_arg_at ? " (bootcpu= corrected)" : "");
++						} else {
++							cpu_mpidr[cpu_count++] = mpidr;
++						}
++					} else {
++						print("core %x answers off but refuses to be started: not the kernel's to take\n", mpidr);
++					}
+ 				} else if (state >= 0) {
+ 					print("core %x is not off (the firmware says %d): not the kernel's to take\n", mpidr, (uint64_t)state);
+ 				}
+@@ -3205,6 +3323,11 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+ 		}
+ 		print("\n");
+ 	}
++	if (kernel_mpidr == 0) {
++		print("no core can be started for the kernel: the firmware runs on them all\n");
++		write_logs(NULL, 0);
++		return 1;
++	}
+ 
+ 	dt_begin(&w, "cpus");
+ 	for (int i = 0; i < cpu_count; i++) {
+@@ -3743,6 +3866,7 @@ fb_command(char *cmd)
+ 			fb_reply("OKAY", "");
+ 			log_len = 0;
+ 			print("== XNULOADER run (usb) ==\n");
++			print("V5-RUN-ENTRY cp=%d have_cp=%d\n", (uint64_t)cp, (uint64_t)have_cp);
+ 			if (!run_kernel(have_cp, cp)) {
+ 				set_result("not-started", 0, 0);
+ 				compose_logs(NULL, 0);
+@@ -3928,7 +4052,7 @@ efi_main(efi_handle image, efi_system_table *st)
+ 	IMAGE = image;
+ 
+ 	BS->set_watchdog_timer(0, 0, 0, NULL);
+-	print("== XNULOADER v3 ==\n");
++	print("== XNULOADER v6 (probe) ==\n");
+ 	print("CurrentEL=%x MIDR=%x MMFR0=%x CNTFRQ=%d image=%x\n", READ_SYSREG(CurrentEL) >> 2, READ_SYSREG(MIDR_EL1),
+ 	    READ_SYSREG(ID_AA64MMFR0_EL1), READ_SYSREG(CNTFRQ_EL0), (uint64_t)(uintptr_t)&__ImageBase);
+ 
+@@ -3944,9 +4068,12 @@ efi_main(efi_handle image, efi_system_table *st)
+ 		for (unsigned i = 0; i < sizeof(platforms) / sizeof(platforms[0]); i++)
+ 			if (platforms[i]->fb_base == SCREEN.base)
+ 				PLAT = platforms[i];
+-		if (PLAT == &platform_qemu_virt)
++		if (PLAT == &platform_qemu_virt) {
++			/* print first: on a real phone the QEMU-only ramfb fallback dies on the
++			 * fw_cfg MMIO access, and this line is where fb_base comes from */
++			print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
+ 			ramfb_phone_screen();
+-		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
++		}
+ 	}
+ 	print("platform %s\n", PLAT->name);
+ 
+-- 
+2.53.0
+

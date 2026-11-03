@@ -1,0 +1,2449 @@
+From bbf212cef73dae8a4e56bf25424161856ac3021c Mon Sep 17 00:00:00 2001
+From: oxjmo <oxjmo@localhost>
+Date: Sat, 31 Oct 2026 05:44:56 +0000
+Subject: [PATCH 4/7] OnePlus 6 (enchilada): ath10k build path for the WCN3990
+
+The radio's Linux driver lives on the SNOC as a bare qmi/qrtr client;
+lx_ath10k.c wraps what the kernel build needs of it, with the lx-side
+stubs (firmware, regulator, pwrseq, remoteproc) kept minimal. Build it
+with REDWOOD_WIFI=ath10k; ath11k stays the default.
+---
+ tools/mk-ath10k.sh                            |  211 +++
+ tools/mk-ath11k.sh                            |   20 +
+ wifi/lx/include/linux/clk.h                   |   35 +
+ .../lx/include/linux/firmware/qcom/qcom_scm.h |   26 +
+ wifi/lx/include/linux/iommu.h                 |   39 +
+ wifi/lx/include/linux/memremap.h              |   13 +
+ wifi/lx/include/linux/nvmem-consumer.h        |   36 +
+ wifi/lx/include/linux/of.h                    |    8 +
+ wifi/lx/include/linux/of_address.h            |   10 +
+ wifi/lx/include/linux/of_device.h             |   11 +
+ wifi/lx/include/linux/platform_device.h       |   87 ++
+ wifi/lx/include/linux/property.h              |   19 +
+ wifi/lx/include/linux/pwrseq/consumer.h       |   14 +
+ wifi/lx/include/linux/qrtr.h                  |    8 +
+ wifi/lx/include/linux/regulator/consumer.h    |   35 +
+ wifi/lx/include/linux/remoteproc/qcom_rproc.h |   35 +
+ wifi/lx/include/linux/soc/qcom/qmi.h          |   25 +-
+ wifi/lx/include/linux/soc/qcom/smem.h         |   18 +
+ wifi/lx/include/lx_prelude.h                  |    2 +
+ wifi/lx/include/net/sock.h                    |   13 +
+ wifi/lx/patches/acpica-actypes.h.patch        |   89 ++
+ .../patches/include-linux-interrupt.h.patch   |   18 +
+ .../patches/include-linux-netdevice.h.patch   |   19 +
+ .../lx/patches/include-linux-spinlock.h.patch |   12 +
+ wifi/lx/patches/platform-acenv.h.patch        |   11 +
+ wifi/lx/src/lx_ath10k.c                       | 1315 +++++++++++++++++
+ wifi/lx/src/lx_base.c                         |   45 +
+ xnu-build.sh                                  |   12 +-
+ 28 files changed, 2161 insertions(+), 25 deletions(-)
+ create mode 100755 tools/mk-ath10k.sh
+ create mode 100644 wifi/lx/include/linux/clk.h
+ create mode 100644 wifi/lx/include/linux/firmware/qcom/qcom_scm.h
+ create mode 100644 wifi/lx/include/linux/iommu.h
+ create mode 100644 wifi/lx/include/linux/memremap.h
+ create mode 100644 wifi/lx/include/linux/nvmem-consumer.h
+ create mode 100644 wifi/lx/include/linux/of_address.h
+ create mode 100644 wifi/lx/include/linux/of_device.h
+ create mode 100644 wifi/lx/include/linux/platform_device.h
+ create mode 100644 wifi/lx/include/linux/property.h
+ create mode 100644 wifi/lx/include/linux/pwrseq/consumer.h
+ create mode 100644 wifi/lx/include/linux/qrtr.h
+ create mode 100644 wifi/lx/include/linux/regulator/consumer.h
+ create mode 100644 wifi/lx/include/linux/remoteproc/qcom_rproc.h
+ create mode 100644 wifi/lx/include/linux/soc/qcom/smem.h
+ create mode 100644 wifi/lx/include/net/sock.h
+ create mode 100644 wifi/lx/patches/acpica-actypes.h.patch
+ create mode 100644 wifi/lx/patches/include-linux-interrupt.h.patch
+ create mode 100644 wifi/lx/patches/include-linux-netdevice.h.patch
+ create mode 100644 wifi/lx/patches/include-linux-spinlock.h.patch
+ create mode 100644 wifi/lx/patches/platform-acenv.h.patch
+ create mode 100644 wifi/lx/src/lx_ath10k.c
+
+diff --git a/tools/mk-ath10k.sh b/tools/mk-ath10k.sh
+new file mode 100755
+index 0000000..a047386
+--- /dev/null
++++ b/tools/mk-ath10k.sh
+@@ -0,0 +1,211 @@
++#!/bin/bash
++# Build the driver of the OnePlus 6's Wi-Fi radio for our kernel: ath10k, Qualcomm's driver for
++# the WCN3990 as it is in Linux, unmodified, on a layer that gives it the kernel interfaces it
++# expects. Three things meet here, and only the third is in the repository:
++#
++#   Linux's ath10k        drivers/net/wireless/ath/ath10k of a pinned release of Linux (ISC);
++#   FreeBSD's LinuxKPI    the headers with which FreeBSD compiles Linux drivers, with the kernel
++#                         headers those are written against (BSD-2-Clause, of a pinned release
++#                         of FreeBSD); patched with wifi/lx/patches/*.patch. Its source files
++#                         are not used: what they do is done in wifi/lx/src;
++#   wifi/lx               ours: the headers LinuxKPI lacks (device tree, platform devices, the
++#                         radio's supplies and clocks, its SMMU), and the functions underneath
++#                         (locks, sleeping, work, memory, firmware, the radio's bus) written on
++#                         the handful of calls that the kernel's bsd/dev/redwood_lx.c offers
++#                         (bsd/sys/redwood_lx.h of the kernel tree). src/lx_ath10k.c is what
++#                         stands in the driver's place of snoc.c's platform device, as lx_bus.c
++#                         stood in ath11k's place of ahb.c; the rest of the layer is shared.
++#
++# Not all of the driver is built yet: DRIVER below lists the files that are. What they call in
++# the files that are not becomes a function that says its name in the log and answers 0
++# (out/stubs.txt lists them), unless wifi/lx/src has one that does more. The radio sits on the
++# SoC's network (SNOC), not on PCIe, so the driver's pci.c, ahb.c, sdio.c and usb.c stay out;
++# snoc.c, the bus it does have, is in. Its debug.c stays out too: src/lx_ath10k.c says what it
++# would (ath10k_dbg and its kind), as lx_bus.c does for ath11k's.
++#
++# Everything is compiled as FreeBSD kernel code for an Apple arm64 kernel and tied into one
++# object that shows nothing but its entry points; the kernel links it when it is there
++# (xnu-build.sh reads xnu-deps/build/ath10k/out/ath10k.o when REDWOOD_WIFI=ath10k).
++#
++#   VERSION   of Linux. 7.0.14, the release LinuxKPI's 802.11 headers follow; for the WCN3990
++#             the driver asks the same of firmware and platform as in the 6.6 series.
++#   FREEBSD   15.1-RELEASE, the first release whose LinuxKPI is at Linux 7.0.
++#
++# What comes out, in xnu-deps/build/ath10k:
++#   src/ath10k/        the driver's files, untouched       freebsd/sys/   FreeBSD's, patched
++#   out/ath10k.o       the object for the kernel           out/stubs.txt  what is not there yet
++# Needs on this machine: curl, tar, xz, sha256sum, patch, awk, clang, and the kernel's linker
++# (xnu-deps/host/bin/ld64, see xnu-deps/setup.sh). The two archives are 150 and 253 MB and are
++# kept; the Linux one is shared with tools/mk-ath11k.sh by way of a link made here.
++#
++# usage: tools/mk-ath10k.sh [fetch]        "fetch" stops when the driver's sources are there
++set -e
++# the tools this runs pick up a wrong liblzma otherwise, and cannot unpack with it
++unset LD_LIBRARY_PATH LD_PRELOAD
++VERSION=7.0.14
++SHA256=de9999b784d2293f00d39c62d8f92a08ab8a54bc4e80ffd250a0c09cb07a0f98
++ROOT=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
++B=$ROOT/xnu-deps/build/ath10k
++ATH=drivers/net/wireless/ath
++mkdir -p "$B"
++cd "$B"
++# one Linux tree serves both drivers: take the archive from mk-ath11k.sh's directory when it has it
++[ -f linux-$VERSION.tar.xz ] || ln -s ../ath11k/linux-$VERSION.tar.xz linux-$VERSION.tar.xz
++
++if [ "$(cat src/.release 2>/dev/null)" != "$VERSION $SHA256" ]; then
++	[ -f linux-$VERSION.tar.xz ] || curl -sL --fail -o linux-$VERSION.tar.xz \
++		https://cdn.kernel.org/pub/linux/kernel/v${VERSION%%.*}.x/linux-$VERSION.tar.xz
++	echo "$SHA256  linux-$VERSION.tar.xz" | sha256sum -c --quiet
++	rm -rf src unpacked
++	mkdir unpacked
++	tar xJf linux-$VERSION.tar.xz -C unpacked --strip-components=1 linux-$VERSION/$ATH/ath10k \
++		linux-$VERSION/$ATH/ath.h linux-$VERSION/$ATH/regd.h linux-$VERSION/$ATH/regd.c \
++		linux-$VERSION/$ATH/regd_common.h linux-$VERSION/$ATH/dfs_pattern_detector.h \
++		linux-$VERSION/$ATH/spectral_common.h
++	# every file must say itself that it may be used so: the licence is checked, not assumed.
++	# ath10k's files carry the ISC as an SPDX tag alone, where ath11k's spell it out.
++	for f in unpacked/$ATH/ath10k/*.[ch] unpacked/$ATH/ath.h unpacked/$ATH/regd.h \
++		unpacked/$ATH/regd.c unpacked/$ATH/regd_common.h unpacked/$ATH/dfs_pattern_detector.h \
++		unpacked/$ATH/spectral_common.h; do
++		case "$(head -6 "$f")" in
++		*"SPDX-License-Identifier: BSD-3-Clause-Clear"*) ;;
++		*"SPDX-License-Identifier: ISC"*) ;;
++		*"Permission to use, copy, modify, and/or distribute this software"*) ;;      # (ISC, spelt out)
++		*) echo "mk-ath10k.sh: $f does not carry the licence expected" >&2; exit 1 ;;
++		esac
++	done
++	mkdir src
++	mv unpacked/$ATH/ath10k src/ath10k
++	mv unpacked/$ATH/ath.h unpacked/$ATH/regd.h unpacked/$ATH/regd.c \
++		unpacked/$ATH/regd_common.h unpacked/$ATH/dfs_pattern_detector.h \
++		unpacked/$ATH/spectral_common.h src/
++	rm -rf unpacked
++	echo "$VERSION $SHA256" > src/.release
++fi
++[ "$1" = fetch ] && { echo "mk-ath10k.sh: ath10k of Linux $VERSION: $B/src/ath10k"; exit 0; }
++W=$ROOT/wifi/lx
++
++# --- FreeBSD's LinuxKPI and the kernel headers under it, with our patches on top. When the patches
++# change, the tree is taken from the archive again (as tools/mk-mesa.sh does with Mesa's).
++FREEBSD=15.1
++FREEBSD_SHA256=cf5762da53fd52e1eaf0f9ceee9bf58cbe314c821031d0d9ffa76823185a89e1
++FSYS="compat/linuxkpi sys arm64/include net net80211 netinet netinet6 vm kern tools libkern ddb
++	security fs/pseudofs crypto opencrypto geom bsm isa cam rpc xdr x86/include ofed/include
++	dev/pci dev/ofw dev/fdt dev/acpica dev/usb dev/iicbus dev/backlight
++	contrib/ck/include contrib/dev/acpica/include contrib/libnv"
++PATCHES=$(cat "$W"/patches/*.patch 2>/dev/null | sha256sum | cut -d' ' -f1)
++if [ "$(cat freebsd/.release 2>/dev/null)" != "$FREEBSD $FREEBSD_SHA256 $PATCHES" ]; then
++	[ -f freebsd-$FREEBSD-src.txz ] || curl -sL --fail -o freebsd-$FREEBSD-src.txz \
++		https://download.freebsd.org/releases/amd64/$FREEBSD-RELEASE/src.txz
++	echo "$FREEBSD_SHA256  freebsd-$FREEBSD-src.txz" | sha256sum -c --quiet
++	rm -rf freebsd gen obj
++	mkdir freebsd
++	tar xJf freebsd-$FREEBSD-src.txz -C freebsd --strip-components=2 usr/src/COPYRIGHT \
++		$(for d in $FSYS; do echo usr/src/sys/$d; done)
++	for p in "$W"/patches/*.patch; do
++		[ -f "$p" ] && patch -s --no-backup-if-mismatch -d freebsd -p1 < "$p"
++	done
++	echo "$FREEBSD $FREEBSD_SHA256 $PATCHES" > freebsd/.release
++fi
++S=$B/freebsd/sys
++
++# --- what FreeBSD's build would have generated: the interfaces of its device framework, and the
++# option headers, which here say only that there is an Internet
++if [ ! -d gen ]; then
++	mkdir gen
++	(
++		cd gen
++		ln -s $S/arm64/include machine
++		for m in kern/device_if.m kern/bus_if.m dev/pci/pci_if.m dev/pci/pci_iov_if.m dev/pci/pcib_if.m \
++			dev/iicbus/iicbus_if.m dev/iicbus/iicbb_if.m dev/backlight/backlight_if.m dev/usb/usb_if.m \
++			dev/ofw/ofw_bus_if.m; do
++			awk -f $S/tools/makeobjops.awk $S/$m -h
++		done
++		for o in h p q; do awk -f $S/tools/vnode_if.awk $S/kern/vnode_if.src -$o; done
++		for o in $(grep -rhoE "opt_[a-z0-9_]+\.h" $S | sort -u) lkpi_iic_if.h; do : > $o; done
++		printf '#define INET 1\n#define INET6 1\n' > opt_inet.h
++		printf '#define INET6 1\n' > opt_inet6.h
++		printf '#define SMP 1\n' > opt_global.h
++	)
++fi
++
++# --- compile: the driver's files that are built so far, and ours. lx_bus.c stays out: it is
++# ath11k's bus stand-in (WCN6750 on AHB); ath10k's own snoc.c is in, and lx_ath10k.c is what
++# stands where its platform device would be. coredump.c stays out: what its parts not built would
++# give the kernel's crash report is had from the driver's own log for now.
++DRIVER="core snoc qmi qmi_wlfw_v01 htc wmi wmi-tlv ce mac htt htt_rx htt_tx txrx bmi hw swap
++	p2p"
++SHARED="regd"		# the ath/ files the driver shares (src/regd.c)
++OURS="lx_base lx_80211 lx_wpa lx_ath10k"
++CC="clang -target arm64-apple-ios16.5"
++LD=$ROOT/xnu-deps/host/bin/ld64
++CFLAGS="-mkernel -mgeneral-regs-only -fno-builtin -fno-common -ffreestanding -fno-strict-aliasing
++	-funsigned-char -nostdinc -std=gnu17 -O2 -g -w
++	-D__FreeBSD__=15 -D_KERNEL -DKLD_MODULE -DHAVE_KERNEL_OPTION_HEADERS -include opt_global.h
++	-I$W/include -Igen -I$S -I$S/contrib/ck/include
++	-I$S/compat/linuxkpi/common/include -I$S/compat/linuxkpi/dummy/include
++	-include $S/compat/linuxkpi/common/include/linux/kconfig.h -DLINUXKPI_VERSION=70000"
++DFLAGS="-Isrc/ath10k -Isrc -include $W/include/lx_prelude.h -DCONFIG_ATH10K_DEBUG
++	-DKBUILD_MODNAME=\"ath10k\""
++# two headers are the kernel's: what it offers this object (wifi/lx/include/lx_os.h), and its QMI
++# helpers (wifi/lx/include/linux/soc/qcom/qmi.h)
++source "$ROOT/xnu-env.sh"
++for h in lx qmi; do
++	[ -f "$XNU_SRC/bsd/sys/redwood_$h.h" ] || { echo "mk-ath10k.sh: the kernel tree has no bsd/sys/redwood_$h.h" >&2; exit 1; }
++done
++DFLAGS="$DFLAGS -DLX_REDWOOD_LX_H=\"$XNU_SRC/bsd/sys/redwood_lx.h\" -DLX_REDWOOD_QMI_H=\"$XNU_SRC/bsd/sys/redwood_qmi.h\""
++mkdir -p obj out
++rm -f obj/*.err
++compile() {		# compile SOURCE OBJECT [FLAGS]: only when the object is older than anything it was made of
++	local src=$1 obj=$2
++	shift 2
++	if [ -f "$obj" ] && [ -f "$obj.d" ] && [ -z "$(find $(sed -e 's/^[^:]*://' -e 's/\\$//' "$obj.d") "$0" -newer "$obj" 2>/dev/null | head -1)" ]; then
++		return
++	fi
++	$CC $CFLAGS "$@" -MMD -MF "$obj.d" -c "$src" -o "$obj" 2> "$obj.err" || rm -f "$obj"
++}
++for f in $DRIVER; do compile src/ath10k/$f.c obj/ath10k_$f.o $DFLAGS & done
++for f in $SHARED; do compile src/$f.c obj/ath10k_$f.o $DFLAGS -Isrc -I$S/net80211 & done
++for f in $OURS; do compile "$W/src/$f.c" obj/$f.o $DFLAGS -I$W/src & done
++wait
++bad=
++for f in obj/*.err; do
++	[ -s "$f" ] && [ ! -f "${f%.err}" ] && { echo "--- $(basename "$f" .o.err)"; grep -m6 -A3 "error:" "$f"; bad=1; }
++done
++[ -z "$bad" ] || exit 1
++OBJECTS=$(for f in $DRIVER $SHARED; do echo obj/ath10k_$f.o; done; for f in $OURS; do echo obj/$f.o; done)
++
++# --- tie it all into one object. What it then still wants is one of three things: a call of the
++# kernel's (redwood_lx.h; the QMI helpers; the handful of C library functions XNU has under the same
++# names with the same meaning), a function of a part of the driver that is not built yet, or a
++# mistake. The second kind gets a stub each that says its name and answers 0; anything else
++# missing ends the build.
++KERNEL="memcmp memcpy memmove memset strcmp strncmp strlen strchr strrchr strlcpy strlcat bzero
++	snprintf vsnprintf __stack_chk_fail __stack_chk_guard
++	device_printf DELAY pause_sbt nanouptime"
++$LD -r -arch arm64 $OBJECTS -o out/all.o 2> out/ld.err || { cat out/ld.err; exit 1; }
++llvm-nm -u --format=just-symbols out/all.o | sed 's/^_//' | sort > out/undefined.txt
++: > out/stubs.txt
++: > out/stubs.s
++missing=
++for s in $(cat out/undefined.txt); do
++	case " $(echo $KERNEL) " in *" $s "*) continue ;; esac
++	case $s in
++	lx_os_*|qmi_*|redwood_qmi_*|section\$*) continue ;;
++	ath10k_*|__ath10k_*) ;;
++	*) echo "mk-ath10k.sh: nothing defines $s" >&2; missing=1; continue ;;
++	esac
++	echo $s >> out/stubs.txt
++	printf '\t.globl _%s\n_%s:\n\tadrp x0, 1f@PAGE\n\tadd x0, x0, 1f@PAGEOFF\n\tb _lx_stub\n\t.cstring\n1:\t.asciz "%s"\n\t.text\n\t.p2align 2\n' \
++		$s $s $s >> out/stubs.s
++done
++[ -z "$missing" ] || exit 1
++$CC -c out/stubs.s -o out/stubs.o
++# four names are shown: where the kernel enters (lx_prepare(), lx_start(), lx_stop() and lx_transmit() of redwood_lx.h)
++printf '_lx_prepare\n_lx_start\n_lx_stop\n_lx_transmit\n' > out/exported.txt
++$LD -r -arch arm64 -exported_symbols_list out/exported.txt out/all.o out/stubs.o -o out/ath10k.o 2> out/ld.err ||
++	{ cat out/ld.err; exit 1; }
++rm -f out/all.o
++echo "mk-ath10k.sh: out/ath10k.o: $(llvm-size out/ath10k.o | awk 'NR == 2 { print $1 + $2 }') bytes of code and data from" \
++	"$(echo $DRIVER | wc -w) of the driver's files; $(wc -l < out/stubs.txt) functions of the others are stubs (out/stubs.txt);" \
++	"asks the kernel for $(llvm-nm -u --format=just-symbols out/ath10k.o | grep -vc 'section\$') names"
+diff --git a/tools/mk-ath11k.sh b/tools/mk-ath11k.sh
+index f06a33b..8b88ec9 100755
+--- a/tools/mk-ath11k.sh
++++ b/tools/mk-ath11k.sh
+@@ -67,6 +67,26 @@ if [ "$(cat src/.release 2>/dev/null)" != "$VERSION $SHA256" ]; then
+ 	echo "$VERSION $SHA256" > src/.release
+ fi
+ [ "$1" = fetch ] && { echo "mk-ath11k.sh: ath11k of Linux $VERSION: $B/src/ath11k"; exit 0; }
++
++# --- MHI (drivers/bus/mhi/host of the same Linux tree): the bus the radio's firmware is carried
++# over, when the radio sits on PCIe as the OnePlus 6's WCN3990 does (ath11k's pci.c is written
++# against it). GPL-2.0: its own licence track, checked separately here, and built only when the
++# PCI path of the driver is (a later step of the port). The same archive is the source.
++if [ "$(cat src/.mhi_release 2>/dev/null)" != "$VERSION $SHA256" ]; then
++	rm -rf src/mhi
++	mkdir -p src/mhi/include
++	tar xJf linux-$VERSION.tar.xz -C src/mhi --strip-components=4 linux-$VERSION/drivers/bus/mhi/host
++	tar xJf linux-$VERSION.tar.xz -C src/mhi/include --strip-components=2 linux-$VERSION/include/linux/mhi.h
++	# every file must say itself that it may be used so: the licence is checked, not assumed
++	for f in src/mhi/host/*.c src/mhi/host/*.h src/mhi/include/linux/mhi.h; do
++		case "$(head -4 "$f")" in
++		*"GPL-2.0"*) ;;
++		*) echo "mk-ath11k.sh: $f does not carry the licence expected (GPL-2.0)" >&2; exit 1 ;;
++		esac
++	done
++	echo "$VERSION $SHA256" > src/.mhi_release
++fi
++[ "$1" = mhi ] && { echo "mk-ath11k.sh: MHI host of Linux $VERSION: $B/src/mhi/host"; exit 0; }
+ W=$ROOT/wifi/lx
+ 
+ # --- FreeBSD's LinuxKPI and the kernel headers under it, with our patches on top. When the patches
+diff --git a/wifi/lx/include/linux/clk.h b/wifi/lx/include/linux/clk.h
+new file mode 100644
+index 0000000..32b94bf
+--- /dev/null
++++ b/wifi/lx/include/linux/clk.h
+@@ -0,0 +1,35 @@
++/* The radio's clocks, as drivers ask for them. There is no clock framework under XNU: what a
++ * clock is, and what gating it means, is in src/lx_ath10k.c, from what the machine says. */
++#ifndef _LX_LINUX_CLK_H
++#define _LX_LINUX_CLK_H
++
++#include <linux/device.h>
++
++struct clk;
++
++struct clk_bulk_data {
++	const char *id;
++	struct clk *clk;
++};
++
++struct clk *clk_get(struct device *dev, const char *id);
++void clk_put(struct clk *clk);
++int clk_prepare_enable(struct clk *clk);
++void clk_disable_unprepare(struct clk *clk);
++unsigned long clk_get_rate(struct clk *clk);
++
++int clk_bulk_get(struct device *dev, int count, struct clk_bulk_data *clks);
++void clk_bulk_put(int count, struct clk_bulk_data *clks);
++int clk_bulk_prepare_enable(int count, struct clk_bulk_data *clks);
++void clk_bulk_disable_unprepare(int count, struct clk_bulk_data *clks);
++
++struct clk *devm_clk_get(struct device *dev, const char *id);
++struct clk *devm_clk_get_optional(struct device *dev, const char *id);
++int devm_clk_bulk_get_optional(struct device *dev, int count, struct clk_bulk_data *clks);
++
++static inline int clk_prepare(struct clk *clk) { return (0); }
++static inline void clk_unprepare(struct clk *clk) { }
++static inline int clk_enable(struct clk *clk) { return (0); }
++static inline void clk_disable(struct clk *clk) { }
++
++#endif
+diff --git a/wifi/lx/include/linux/firmware/qcom/qcom_scm.h b/wifi/lx/include/linux/firmware/qcom/qcom_scm.h
+new file mode 100644
+index 0000000..59b38e0
+--- /dev/null
++++ b/wifi/lx/include/linux/firmware/qcom/qcom_scm.h
+@@ -0,0 +1,26 @@
++/* What the driver asks the machine's secure monitor (TrustZone) for. Only what ath10k's QMI
++ * needs: the handing over of a span of memory to the processors that will use it. The ask
++ * itself goes through the kernel (it is lx_os_scm_assign() of redwood_lx.h). */
++#ifndef _LX_LINUX_FIRMWARE_QCOM_QCOM_SCM_H
++#define _LX_LINUX_FIRMWARE_QCOM_QCOM_SCM_H
++
++#include <linux/types.h>
++
++/* (the identities, as the machine's table has them: 0x3, 0xf, 0x18, 0x19; the rights to read
++ * and to write, 4 and 2, are one each of a bit more) */
++#define QCOM_SCM_VMID_HLOS		3		/* 0x3: this system */
++#define QCOM_SCM_VMID_MSS_MSA		15		/* 0xf: the modem's */
++#define QCOM_SCM_VMID_WLAN		24		/* 0x18: the WLAN's */
++#define QCOM_SCM_VMID_WLAN_CE		25		/* 0x19: the WLAN's copy engines' */
++
++#define QCOM_SCM_PERM_RW		6		/* to read (4) and to write (2) */
++
++struct qcom_scm_vmperm {
++	unsigned int vmid;
++	unsigned int perm;
++};
++
++int qcom_scm_assign_mem(unsigned long long addr, unsigned long long size,
++    const unsigned *src_vmid, const struct qcom_scm_vmperm *newvm, unsigned int count);
++
++#endif
+diff --git a/wifi/lx/include/linux/iommu.h b/wifi/lx/include/linux/iommu.h
+new file mode 100644
+index 0000000..1f6d051
+--- /dev/null
++++ b/wifi/lx/include/linux/iommu.h
+@@ -0,0 +1,39 @@
++/* The radio's addresses, as the driver sees them through Linux's SMMU face. There is no SMMU
++ * under XNU: what the driver asks of one is answered "it is so" (src/lx_ath10k.c). */
++#ifndef _LX_LINUX_IOMMU_H
++#define _LX_LINUX_IOMMU_H
++
++#include <linux/device.h>
++#include <linux/types.h>
++
++#define IOMMU_READ		(1 << 0)
++#define IOMMU_WRITE		(1 << 1)
++#define IOMMU_CACHE		(1 << 2)
++#define IOMMU_NOEXEC		(1 << 3)
++#define IOMMU_MMIO		(1 << 4)
++
++struct iommu_domain {
++	unsigned int type;
++};
++
++struct iommu_iotlb_gather {
++	unsigned long start;
++	unsigned long end;
++};
++
++struct iommu_domain *iommu_paging_domain_alloc(struct device *dev);
++int iommu_attach_device(struct iommu_domain *domain, struct device *dev);
++void iommu_detach_device(struct iommu_domain *domain, struct device *dev);
++int iommu_map(struct iommu_domain *domain, unsigned long iova, unsigned long long physical,
++    size_t size, int protection, gfp_t gfp);
++size_t iommu_unmap(struct iommu_domain *domain, unsigned long iova, size_t size);
++void iommu_domain_free(struct iommu_domain *domain);
++
++static inline struct iommu_domain *
++iommu_get_domain_for_dev(struct device *dev)
++{
++
++	return (NULL);
++}
++
++#endif
+diff --git a/wifi/lx/include/linux/memremap.h b/wifi/lx/include/linux/memremap.h
+new file mode 100644
+index 0000000..d7bd3a1
+--- /dev/null
++++ b/wifi/lx/include/linux/memremap.h
+@@ -0,0 +1,13 @@
++/* The machine's own memory, mapped for a driver. Under XNU there is nothing to remap: what the
++ * driver asks for is said not to be there (src/lx_ath10k.c). The kinds of mapping are what
++ * Linux's io.h says they are. */
++#ifndef _LX_LINUX_MEMREMAP_H
++#define _LX_LINUX_MEMREMAP_H
++
++#include <linux/device.h>
++#include <linux/err.h>
++
++void *devm_memremap(struct device *dev, unsigned long long offset, size_t size,
++    unsigned long flags);
++
++#endif
+diff --git a/wifi/lx/include/linux/nvmem-consumer.h b/wifi/lx/include/linux/nvmem-consumer.h
+new file mode 100644
+index 0000000..c3fd243
+--- /dev/null
++++ b/wifi/lx/include/linux/nvmem-consumer.h
+@@ -0,0 +1,36 @@
++/* The machine's one-time memories, which a driver may read its calibration from. There is no
++ * such thing under XNU: the cell is said not to be there, and the driver takes the file. */
++#ifndef _LX_LINUX_NVMEM_CONSUMER_H
++#define _LX_LINUX_NVMEM_CONSUMER_H
++
++#include <linux/device.h>
++#include <linux/err.h>
++#include <linux/errno.h>
++
++struct nvmem_cell;
++
++static inline struct nvmem_cell *
++devm_nvmem_cell_get(struct device *dev, const char *name)
++{
++
++	return (ERR_PTR(-ENOENT));
++}
++
++static inline void
++devm_nvmem_cell_put(struct device *dev, struct nvmem_cell *cell)
++{
++}
++
++static inline void *
++nvmem_cell_read(struct nvmem_cell *cell, size_t *lenp)
++{
++
++	return (NULL);
++}
++
++static inline void
++nvmem_cell_put(struct nvmem_cell *cell)
++{
++}
++
++#endif
+diff --git a/wifi/lx/include/linux/of.h b/wifi/lx/include/linux/of.h
+index 7a2ff93..58778f2 100644
+--- a/wifi/lx/include/linux/of.h
++++ b/wifi/lx/include/linux/of.h
+@@ -44,7 +44,15 @@ struct of_device_id {
+ const struct property *of_find_property(const struct device_node *np, const char *name, int *lenp);
+ const void *of_get_property(const struct device_node *np, const char *name, int *lenp);
+ int of_property_read_string(const struct device_node *np, const char *name, const char **out);
++int of_property_read_string_index(const struct device_node *np, const char *name, int index,
++    const char **out);
+ int of_property_read_u32_index(const struct device_node *np, const char *name, u32 index, u32 *out);
++int of_property_read_u8_array(const struct device_node *np, const char *name, u8 *out, size_t count);
++static inline int
++of_property_read_u8(const struct device_node *np, const char *name, u8 *out)
++{
++	return (of_property_read_u8_array(np, name, out, 1));
++}
+ bool of_device_is_compatible(const struct device_node *np, const char *compatible);
+ bool of_machine_is_compatible(const char *compatible);
+ struct device_node *of_get_child_by_name(const struct device_node *np, const char *name);
+diff --git a/wifi/lx/include/linux/of_address.h b/wifi/lx/include/linux/of_address.h
+new file mode 100644
+index 0000000..b0365b0
+--- /dev/null
++++ b/wifi/lx/include/linux/of_address.h
+@@ -0,0 +1,10 @@
++/* Addresses in the device tree, as resources. */
++#ifndef _LX_LINUX_OF_ADDRESS_H
++#define _LX_LINUX_OF_ADDRESS_H
++
++#include <linux/ioport.h>
++#include <linux/of.h>
++
++int of_address_to_resource(const struct device_node *np, int index, struct resource *res);
++
++#endif
+diff --git a/wifi/lx/include/linux/of_device.h b/wifi/lx/include/linux/of_device.h
+new file mode 100644
+index 0000000..1765654
+--- /dev/null
++++ b/wifi/lx/include/linux/of_device.h
+@@ -0,0 +1,11 @@
++/* What a device says it is, as the driver's table of ids sees it; and its addresses, as the
++ * driver sees them through Linux's SMMU face (there is none under XNU: "it is so"). */
++#ifndef _LX_LINUX_OF_DEVICE_H
++#define _LX_LINUX_OF_DEVICE_H
++
++#include <linux/of.h>
++
++const void *of_device_get_match_data(struct device *dev);
++int of_dma_configure(struct device *dev, struct device_node *np, bool coherent);
++
++#endif
+diff --git a/wifi/lx/include/linux/platform_device.h b/wifi/lx/include/linux/platform_device.h
+new file mode 100644
+index 0000000..0201ac6
+--- /dev/null
++++ b/wifi/lx/include/linux/platform_device.h
+@@ -0,0 +1,87 @@
++/* A device on the machine's own bus, as drivers see it: what it is, and where its registers and
++ * its interrupts are (the machine's word of it is in src/lx_ath10k.c). */
++#ifndef _LX_LINUX_PLATFORM_DEVICE_H
++#define _LX_LINUX_PLATFORM_DEVICE_H
++
++#include <linux/kernel.h>
++#include <linux/device.h>
++#include <linux/ioport.h>
++
++struct platform_device {
++	const char *name;
++	int id;
++	bool id_auto;
++	struct device dev;
++	struct resource *resource;
++	u32 num_resources;
++};
++
++struct platform_driver {
++	void (*remove)(struct platform_device *);
++	int (*probe)(struct platform_device *);
++	void (*shutdown)(struct platform_device *);
++	struct device_driver driver;
++};
++
++int platform_driver_register(struct platform_driver *pdrv);
++void platform_driver_unregister(struct platform_driver *pdrv);
++
++struct platform_device_info {
++	struct fwnode_handle *fwnode;
++	struct device *parent;
++	const char *name;
++	u64 dma_mask;
++};
++
++struct platform_device *platform_device_register_full(struct platform_device_info *info);
++
++#define	dev_is_platform(_dev)	(false)
++#define	to_platform_device(_dev)	container_of(_dev, struct platform_device, dev)
++
++struct resource *platform_get_resource(struct platform_device *pdev, unsigned type, unsigned num);
++struct resource *platform_get_resource_byname(struct platform_device *pdev, unsigned type,
++    const char *name);
++int platform_get_irq(struct platform_device *pdev, unsigned num);
++void platform_set_drvdata(struct platform_device *pdev, void *data);
++void *platform_get_drvdata(struct platform_device *pdev);
++
++static inline int
++platform_driver_probe(struct platform_driver *pdrv,
++    int (*pd_probe_f)(struct platform_device *))
++{
++
++	return (0);
++}
++
++static inline int
++platform_device_register(struct platform_device *pdev)
++{
++
++	return (0);
++}
++
++static inline void
++platform_device_unregister(struct platform_device *pdev)
++{
++}
++
++static inline void *
++dev_get_platdata(struct device *dev)
++{
++
++	return (NULL);
++}
++
++/* The driver of such a device, as its own file says it: its registration keeps the driver where
++ * lx_ath10k.c takes it from, to give its probe the device. */
++#define	module_platform_driver(_drv)					\
++	int _drv##_register_(void)					\
++	{								\
++		return (platform_driver_register(&(_drv)));		\
++	}								\
++	void _drv##_unregister_(void)					\
++	{								\
++		platform_driver_unregister(&(_drv));			\
++	}
++
++#endif
+diff --git a/wifi/lx/include/linux/property.h b/wifi/lx/include/linux/property.h
+new file mode 100644
+index 0000000..5bb503d
+--- /dev/null
++++ b/wifi/lx/include/linux/property.h
+@@ -0,0 +1,19 @@
++/* The properties of a device, read without saying through which of the trees they came. Under
++ * XNU the device's node is ours (linux/of.h), and the answers are what src/lx_ath10k.c made of
++ * what the machine says of the radio. */
++#ifndef _LX_LINUX_PROPERTY_H
++#define _LX_LINUX_PROPERTY_H
++
++#include <linux/types.h>
++#include <linux/device.h>
++
++struct fwnode_handle;
++
++struct property_entry;
++
++const void *device_get_match_data(struct device *dev);
++int device_property_read_u32(struct device *dev, const char *name, u32 *value);
++int device_property_read_string(struct device *dev, const char *name, const char **value);
++bool device_property_present(struct device *dev, const char *name);
++
++#endif
+diff --git a/wifi/lx/include/linux/pwrseq/consumer.h b/wifi/lx/include/linux/pwrseq/consumer.h
+new file mode 100644
+index 0000000..a5da1e8
+--- /dev/null
++++ b/wifi/lx/include/linux/pwrseq/consumer.h
+@@ -0,0 +1,14 @@
++/* The power sequence of the radio, as drivers ask for it: a named sequence of gatings the
++ * machine runs. What one is, and what turning it on means, is in src/lx_ath10k.c. */
++#ifndef _LX_LINUX_PWRSEQ_CONSUMER_H
++#define _LX_LINUX_PWRSEQ_CONSUMER_H
++
++#include <linux/device.h>
++
++struct pwrseq;
++
++struct pwrseq *devm_pwrseq_get(struct device *dev, const char *id);
++int pwrseq_power_on(struct pwrseq *pwrseq);
++int pwrseq_power_off(struct pwrseq *pwrseq);
++
++#endif
+diff --git a/wifi/lx/include/linux/qrtr.h b/wifi/lx/include/linux/qrtr.h
+new file mode 100644
+index 0000000..816aa67
+--- /dev/null
++++ b/wifi/lx/include/linux/qrtr.h
+@@ -0,0 +1,8 @@
++/* The modem's addresses for its services: what the kernel's QMI helpers say they are
++ * (redwood_qmi.h), for the driver's files read this header expecting them. */
++#ifndef _LX_LINUX_QRTR_H
++#define _LX_LINUX_QRTR_H
++
++#include LX_REDWOOD_QMI_H
++
++#endif
+diff --git a/wifi/lx/include/linux/regulator/consumer.h b/wifi/lx/include/linux/regulator/consumer.h
+new file mode 100644
+index 0000000..7bcbebf
+--- /dev/null
++++ b/wifi/lx/include/linux/regulator/consumer.h
+@@ -0,0 +1,35 @@
++/* The radio's supplies, as drivers ask for them. There is no regulator framework under XNU: the
++ * kernel has made the radio ready before the driver starts, so what a regulator is asked is
++ * answered "it is so" (src/lx_ath10k.c). */
++#ifndef _LX_LINUX_REGULATOR_CONSUMER_H
++#define _LX_LINUX_REGULATOR_CONSUMER_H
++
++#include <linux/device.h>
++#include <linux/err.h>
++
++struct regulator;
++
++struct regulator_bulk_data {
++	const char *supply;
++	struct regulator *regulator;
++	int ret;
++};
++
++struct regulator *regulator_get(struct device *dev, const char *id);
++struct regulator *devm_regulator_get(struct device *dev, const char *id);
++void regulator_put(struct regulator *regulator);
++int regulator_enable(struct regulator *regulator);
++int regulator_disable(struct regulator *regulator);
++int regulator_set_voltage(struct regulator *regulator, int min_uV, int max_uV);
++int regulator_set_load(struct regulator *regulator, int load_uA);
++int regulator_set_optimum_mode(struct regulator *regulator, int load_uA);
++
++int regulator_bulk_get(struct device *dev, int count, struct regulator_bulk_data *supplies);
++int regulator_bulk_enable(int count, struct regulator_bulk_data *supplies);
++int regulator_bulk_disable(int count, struct regulator_bulk_data *supplies);
++void regulator_bulk_free(int count, struct regulator_bulk_data *supplies);
++
++int devm_regulator_bulk_get(struct device *dev, int count, struct regulator_bulk_data *supplies);
++int devm_regulator_enable(struct device *dev, struct regulator *regulator);
++
++#endif
+diff --git a/wifi/lx/include/linux/remoteproc/qcom_rproc.h b/wifi/lx/include/linux/remoteproc/qcom_rproc.h
+new file mode 100644
+index 0000000..8f3a56c
+--- /dev/null
++++ b/wifi/lx/include/linux/remoteproc/qcom_rproc.h
+@@ -0,0 +1,35 @@
++/* Word of the modem's comings and goings, as the driver wants to hear it. Under XNU nothing
++ * restarts the modem under the driver's feet: there is no word to wait for. */
++#ifndef _LX_LINUX_REMOTEPROC_QCOM_RPROC_H
++#define _LX_LINUX_REMOTEPROC_QCOM_RPROC_H
++
++#include <linux/notifier.h>
++
++/* Word of the modem's comings and goings, as the handlers are called with. */
++enum qcom_ssr_notify_type {
++	QCOM_SSR_BEFORE_POWERUP,
++	QCOM_SSR_AFTER_POWERUP,
++	QCOM_SSR_BEFORE_SHUTDOWN,
++	QCOM_SSR_AFTER_SHUTDOWN,
++};
++
++struct qcom_ssr_notify_data {
++	const char *name;
++	bool crashed;
++};
++
++static inline void *
++qcom_register_ssr_notifier(const char *name, struct notifier_block *nb)
++{
++
++	return ((void *)1);
++}
++
++static inline int
++qcom_unregister_ssr_notifier(void *notifier, struct notifier_block *nb)
++{
++
++	return (0);
++}
++
++#endif
+diff --git a/wifi/lx/include/linux/soc/qcom/qmi.h b/wifi/lx/include/linux/soc/qcom/qmi.h
+index 71332ea..20c511c 100644
+--- a/wifi/lx/include/linux/soc/qcom/qmi.h
++++ b/wifi/lx/include/linux/soc/qcom/qmi.h
+@@ -1,28 +1,9 @@
+-/*
+- * QMI, the protocol in which the driver talks to the radio's firmware before the radio's own
+- * registers exist. The helpers are the kernel's (bsd/sys/redwood_qmi.h, bsd/dev/redwood_qmi.c),
+- * under Linux's names; a kernel tree that does not have them yet gets LinuxKPI's header, in
+- * which every call fails.
+- */
++/* The kernel's helpers for the modem's QMI service, as the drivers ask for them: what
++ * bsd/sys/redwood_qmi.h of the kernel tree says they are, and what redwood_qmi.c of the kernel
++ * does underneath. */
+ #ifndef _LX_LINUX_SOC_QCOM_QMI_H
+ #define _LX_LINUX_SOC_QCOM_QMI_H
+ 
+-#ifdef LX_REDWOOD_QMI_H
+-#include <linux/jiffies.h>
+-#define REDWOOD_QMI_JIFFIES_TO_MS(j)	jiffies_to_msecs(j)
+ #include LX_REDWOOD_QMI_H
+-/*
+- * What the driver sends goes past the radio's bus first (src/lx_bus.c), which has to know of one
+- * request: the mode the firmware is asked for. The radio's registers answer in mission mode only.
+- */
+-int lx_qmi_send_request(struct qmi_handle *qmi, struct sockaddr_qrtr *sq, struct qmi_txn *txn, int msg_id, size_t largest,
+-    const struct qmi_elem_info *ei, const void *structure);
+-#ifndef LX_QMI_AS_IT_IS
+-#define qmi_send_request	lx_qmi_send_request
+-#endif
+-#else
+-#include <linux/socket.h>
+-#include_next <linux/soc/qcom/qmi.h>
+-#endif
+ 
+ #endif
+diff --git a/wifi/lx/include/linux/soc/qcom/smem.h b/wifi/lx/include/linux/soc/qcom/smem.h
+new file mode 100644
+index 0000000..081c9e9
+--- /dev/null
++++ b/wifi/lx/include/linux/soc/qcom/smem.h
+@@ -0,0 +1,18 @@
++/* The SoC's shared memory table of its own images, which the driver reads the firmware's
++ * version from. There is no such table under XNU: qcom_smem_get() says so. */
++#ifndef _LX_LINUX_SOC_QCOM_SMEM_H
++#define _LX_LINUX_SOC_QCOM_SMEM_H
++
++#include <linux/types.h>
++#include <linux/errno.h>
++
++#define QCOM_SMEM_HOST_ANY	-1
++
++static inline void *
++qcom_smem_get(unsigned host, unsigned item, size_t *sizep)
++{
++
++	return (NULL);
++}
++
++#endif
+diff --git a/wifi/lx/include/lx_prelude.h b/wifi/lx/include/lx_prelude.h
+index f537b83..cee64aa 100644
+--- a/wifi/lx/include/lx_prelude.h
++++ b/wifi/lx/include/lx_prelude.h
+@@ -9,4 +9,6 @@
+ #undef WME_AC_VI
+ #undef WME_AC_VO
+ #undef WME_NUM_AC
++#include <linux/delay.h>
++#include <linux/memremap.h>
+ #include <lx_more.h>
+diff --git a/wifi/lx/include/net/sock.h b/wifi/lx/include/net/sock.h
+new file mode 100644
+index 0000000..fad853e
+--- /dev/null
++++ b/wifi/lx/include/net/sock.h
+@@ -0,0 +1,13 @@
++/* The modem's service, as a socket: what the kernel's QMI helpers say it is (redwood_qmi.h),
++ * and the name Linux gives the address a caller may not say the size of. */
++#ifndef _LX_NET_SOCK_H
++#define _LX_NET_SOCK_H
++
++#include <sys/socket.h>
++#include LX_REDWOOD_QMI_H
++
++struct sockaddr_unsized {
++	unsigned short sa_family;
++};
++
++#endif
+diff --git a/wifi/lx/patches/acpica-actypes.h.patch b/wifi/lx/patches/acpica-actypes.h.patch
+new file mode 100644
+index 0000000..b287bd3
+--- /dev/null
++++ b/wifi/lx/patches/acpica-actypes.h.patch
+@@ -0,0 +1,89 @@
++--- a/sys/contrib/dev/acpica/include/actypes.h
+++++ b/sys/contrib/dev/acpica/include/actypes.h
++@@ -1076,52 +1076,52 @@
++  */
++ typedef union acpi_object
++ {
++-    ACPI_OBJECT_TYPE                Type;   /* See definition of AcpiNsType for values */
+++    ACPI_OBJECT_TYPE                type;   /* See definition of AcpiNsType for values */
++     struct
++     {
++-        ACPI_OBJECT_TYPE                Type;       /* ACPI_TYPE_INTEGER */
++-        UINT64                          Value;      /* The actual number */
++-    } Integer;
+++        ACPI_OBJECT_TYPE                type;       /* ACPI_TYPE_INTEGER */
+++        UINT64                          value;      /* The actual number */
+++    } integer;
++ 
++     struct
++     {
++-        ACPI_OBJECT_TYPE                Type;       /* ACPI_TYPE_STRING */
++-        UINT32                          Length;     /* # of bytes in string, excluding trailing null */
++-        char                            *Pointer;   /* points to the string value */
++-    } String;
+++        ACPI_OBJECT_TYPE                type;       /* ACPI_TYPE_STRING */
+++        UINT32                          length;     /* # of bytes in string, excluding trailing null */
+++        char                            *pointer;   /* points to the string value */
+++    } string;
++ 
++     struct
++     {
++-        ACPI_OBJECT_TYPE                Type;       /* ACPI_TYPE_BUFFER */
++-        UINT32                          Length;     /* # of bytes in buffer */
++-        UINT8                           *Pointer;   /* points to the buffer */
++-    } Buffer;
+++        ACPI_OBJECT_TYPE                type;       /* ACPI_TYPE_BUFFER */
+++        UINT32                          length;     /* # of bytes in buffer */
+++        UINT8                           *pointer;   /* points to the buffer */
+++    } buffer;
++ 
++     struct
++     {
++-        ACPI_OBJECT_TYPE                Type;       /* ACPI_TYPE_PACKAGE */
++-        UINT32                          Count;      /* # of elements in package */
++-        union acpi_object               *Elements;  /* Pointer to an array of ACPI_OBJECTs */
++-    } Package;
+++        ACPI_OBJECT_TYPE                type;       /* ACPI_TYPE_PACKAGE */
+++        UINT32                          count;      /* # of elements in package */
+++        union acpi_object               *elements;  /* Pointer to an array of ACPI_OBJECTs */
+++    } package;
++ 
++     struct
++     {
++-        ACPI_OBJECT_TYPE                Type;       /* ACPI_TYPE_LOCAL_REFERENCE */
++-        ACPI_OBJECT_TYPE                ActualType; /* Type associated with the Handle */
++-        ACPI_HANDLE                     Handle;     /* object reference */
++-    } Reference;
+++        ACPI_OBJECT_TYPE                type;       /* ACPI_TYPE_LOCAL_REFERENCE */
+++        ACPI_OBJECT_TYPE                Actualtype; /* Type associated with the Handle */
+++        ACPI_HANDLE                     handle;     /* object reference */
+++    } reference;
++ 
++     struct
++     {
++-        ACPI_OBJECT_TYPE                Type;       /* ACPI_TYPE_PROCESSOR */
+++        ACPI_OBJECT_TYPE                type;       /* ACPI_TYPE_PROCESSOR */
++         UINT32                          ProcId;
++         ACPI_IO_ADDRESS                 PblkAddress;
++         UINT32                          PblkLength;
++-    } Processor;
+++    } processor;
++ 
++     struct
++     {
++-        ACPI_OBJECT_TYPE                Type;       /* ACPI_TYPE_POWER */
+++        ACPI_OBJECT_TYPE                type;       /* ACPI_TYPE_POWER */
++         UINT32                          SystemLevel;
++         UINT32                          ResourceOrder;
++     } PowerResource;
++@@ -1159,8 +1159,8 @@
++ 
++ typedef struct acpi_buffer
++ {
++-    ACPI_SIZE                       Length;         /* Length in bytes of the buffer */
++-    void                            *Pointer;       /* pointer to buffer */
+++    ACPI_SIZE                       length;         /* Length in bytes of the buffer */
+++    void                            *pointer;       /* pointer to buffer */
++ 
++ } ACPI_BUFFER;
++ 
+diff --git a/wifi/lx/patches/include-linux-interrupt.h.patch b/wifi/lx/patches/include-linux-interrupt.h.patch
+new file mode 100644
+index 0000000..9a1ab45
+--- /dev/null
++++ b/wifi/lx/patches/include-linux-interrupt.h.patch
+@@ -0,0 +1,18 @@
++--- a/sys/compat/linuxkpi/common/include/linux/interrupt.h
+++++ b/sys/compat/linuxkpi/common/include/linux/interrupt.h
++@@ -43,4 +43,17 @@ typedef	irqreturn_t	(*irq_handler_t)(int, void *);
++ #define	IRQF_SHARED		0x0004	/* Historically */
++ #define	IRQF_NOBALANCING	0
+++#define	IRQF_PROBE		0
+++#define	IRQF_TIMER		0
+++#define	IRQF_PERCPU		0
+++#define	IRQF_IRQPOLL		0
+++#define	IRQF_ONESHOT		0
+++#define	IRQF_NO_SUSPEND		0
+++#define	IRQF_FORCE_RESUME	0
+++#define	IRQF_NO_AUTOEN		0
+++#define	IRQF_TRIGGER_NONE	0
+++#define	IRQF_TRIGGER_RISING	0
+++#define	IRQF_TRIGGER_FALLING	0
+++#define	IRQF_TRIGGER_HIGH	0
+++#define	IRQF_TRIGGER_LOW	0
+diff --git a/wifi/lx/patches/include-linux-netdevice.h.patch b/wifi/lx/patches/include-linux-netdevice.h.patch
+new file mode 100644
+index 0000000..862059f
+--- /dev/null
++++ b/wifi/lx/patches/include-linux-netdevice.h.patch
+@@ -0,0 +1,19 @@
++--- a/sys/compat/linuxkpi/common/include/linux/netdevice.h
+++++ b/sys/compat/linuxkpi/common/include/linux/netdevice.h
++@@ -1130,5 +1130,16 @@
++ #define	rtnl_lock()		do { } while(0)
++ #define	rtnl_unlock()		do { } while(0)
++ #define	rcu_dereference_rtnl(x)	READ_ONCE(x)
+++
+++/* The data path's rings are looked at on a thread of the kernel's, as Linux's threaded NAPI
+++ * would have it: there is nothing to ask for. */
+++static inline void
+++netif_threaded_enable(struct net_device *dev __unused)
+++{
+++}
+++static inline void
+++netif_threaded_disable(struct net_device *dev __unused)
+++{
+++}
++
++ #endif	/* _LINUXKPI_LINUX_NETDEVICE_H */
+diff --git a/wifi/lx/patches/include-linux-spinlock.h.patch b/wifi/lx/patches/include-linux-spinlock.h.patch
+new file mode 100644
+index 0000000..e181513
+--- /dev/null
++++ b/wifi/lx/patches/include-linux-spinlock.h.patch
+@@ -0,0 +1,12 @@
++--- a/sys/compat/linuxkpi/common/include/linux/spinlock.h
+++++ b/sys/compat/linuxkpi/common/include/linux/spinlock.h
++@@ -216,6 +216,11 @@ DEFINE_LOCK_GUARD_1(spinlock_irqsave,
++     spin_unlock_irqrestore(_T->lock, _T->flags),
++     unsigned long flags)
++
+++DEFINE_LOCK_GUARD_1(spinlock_bh,
+++    spinlock_t,
+++    spin_lock_bh(_T->lock),
+++    spin_unlock_bh(_T->lock))
+++
++ #endif					/* _LINUXKPI_LINUX_SPINLOCK_H_ */
+diff --git a/wifi/lx/patches/platform-acenv.h.patch b/wifi/lx/patches/platform-acenv.h.patch
+new file mode 100644
+index 0000000..6d5cdf2
+--- /dev/null
++++ b/wifi/lx/patches/platform-acenv.h.patch
+@@ -0,0 +1,11 @@
++--- a/sys/contrib/dev/acpica/include/platform/acenv.h
+++++ b/sys/contrib/dev/acpica/include/platform/acenv.h
++@@ -311,7 +311,7 @@
++ #if defined(_LINUX) || defined(__linux__)
++ #include "aclinux.h"
++
++-#elif defined(_APPLE) || defined(__APPLE__)
+++#elif (defined(_APPLE) || defined(__APPLE__)) && !(defined(__FreeBSD__) || defined(__FreeBSD_kernel__))
++ #include "acmacosx.h"
++
++ #elif defined(__DragonFly__)
+diff --git a/wifi/lx/src/lx_ath10k.c b/wifi/lx/src/lx_ath10k.c
+new file mode 100644
+index 0000000..b2b63b4
+--- /dev/null
++++ b/wifi/lx/src/lx_ath10k.c
+@@ -0,0 +1,1315 @@
++/*
++ * The radio's machine, for ath10k: what stands between the driver and this phone's WCN3990 where
++ * its own bus (snoc.c) asks the machine what is there. snoc.c runs its probe here on a device we
++ * say -- the one the machine's own table would have had for the radio ("wlan@18800000", with its
++ * registers and its eleven interrupts) -- and everything the driver asks of the parts of Linux
++ * that are not there is answered from what this phone is.
++ *
++ * There is no device tree under XNU, and none of Linux's framework of supplies, clocks and
++ * firmware tables: the radio is made ready by the kernel before the driver starts (its supplies
++ * and its clocks are the kernel's to mind; lx_os_rproc_boot() is the modem's coming up), so the
++ * driver's questions about its regulators, its clocks and its power sequence are answered "it is
++ * so", and its firmware comes from where lx_os_firmware() reads. What it asks of the machine's
++ * secure monitor -- the handing over of a span of memory to the modem, that the firmware may be
++ * worked in it -- goes through the kernel (lx_os_scm_assign() of redwood_lx.h): TrustZone is
++ * asked, and what it says is said in the log.
++ *
++ * Its interrupts are the kernel's vectors: the driver's handler for a copy engine runs there,
++ * masked to begin with, as the driver itself asks for (IRQF_NO_AUTOEN), and is quieted where the
++ * driver asks for it. The driver's memory that lives as long as its device does is kept in
++ * Linux's way of it: a head of a few words before the memory, and the device a list of them,
++ * taken down when lx_stop() takes the driver down.
++ *
++ * Where this stage ends: snoc.c has made the radio's memory and its copy engines known to the
++ * driver and has started its QMI, qmi.c has had its exchange with the firmware through the
++ * modem's service (the firmware in MSA memory, granted to the modem by the machine's monitor),
++ * core.c has started the firmware in mission mode and htc.c, wmi.c and mac.c have been through
++ * what they are built for; what the firmware has said is in the log. With the boot-arg
++ * wifi_scan=1 the station of lx_80211.c has the radio scan, and the driver is taken down again
++ * the way its own removal does it (ath10k_snoc_remove()); with wifi_join=1 the station joins the
++ * network the kernel was given, and the driver stays up, carrying the kernel's frames, until
++ * lx_stop().
++ *
++ * The kernel's boot-arg wifi_debug is the driver's own debug_mask: say what kinds of its things
++ * are to be said as they happen (a sum of the ATH10K_DBG_* of debug.h; 0, and only what the
++ * driver says with ath10k_err() and ath10k_warn() is said).
++ */
++#include <linux/kernel.h>
++#include <linux/ioport.h>
++#include <linux/device.h>
++#include <linux/io.h>
++#include <linux/of.h>
++#include <linux/clk.h>
++#include <linux/regulator/consumer.h>
++#include <linux/platform_device.h>
++#include <linux/firmware.h>
++#include <linux/interrupt.h>
++#include <linux/iommu.h>
++#include <linux/pwrseq/consumer.h>
++#include <linux/firmware/qcom/qcom_scm.h>
++#include <linux/skbuff.h>
++
++#include "core.h"
++#include "snoc.h"
++#include "debug.h"
++
++#include <lx_os.h>
++#include "lx.h"
++
++/* ---- what the driver says ---------------------------------------------------------------------- */
++
++/* (the driver's own debug_mask: core.c has the variable, lx_start() takes it from wifi_debug) */
++
++static void
++driver_says(const char *format, va_list list)
++{
++	char line[320];
++	size_t length;
++
++	vsnprintf(line, sizeof(line), format, list);
++	length = strlen(line);
++	printf("ath10k: %s%s", line, length != 0 && line[length - 1] == '\n' ? "" : "\n");
++}
++
++static void
++says_v(const char *format, va_list list)
++{
++
++	driver_says(format, list);
++}
++
++static void __printf(1, 2)
++says(const char *format, ...)
++{
++	va_list list;
++
++	va_start(list, format);
++	says_v(format, list);
++	va_end(list);
++}
++
++static void
++says_about_v(struct ath10k *ar, const char *format, va_list list)
++{
++	char line[288];
++	size_t length;
++
++	if (ar == NULL) {
++		says_v(format, list);
++		return;
++	}
++	vsnprintf(line, sizeof(line), format, list);
++	length = strlen(line);
++	says("%s: %s%s", dev_name(ar->dev), line, length != 0 && line[length - 1] == '\n' ? "" : "\n");
++}
++
++void
++ath10k_info(struct ath10k *ar, const char *format, ...)
++{
++	va_list list;
++
++	va_start(list, format);
++	says_about_v(ar, format, list);
++	va_end(list);
++}
++
++void
++ath10k_err(struct ath10k *ar, const char *format, ...)
++{
++	va_list list;
++
++	va_start(list, format);
++	says_about_v(ar, format, list);
++	va_end(list);
++}
++
++void
++ath10k_warn(struct ath10k *ar, const char *format, ...)
++{
++	va_list list;
++
++	va_start(list, format);
++	says_about_v(ar, format, list);
++	va_end(list);
++}
++
++void
++__ath10k_dbg(struct ath10k *ar, enum ath10k_debug_mask mask, const char *format, ...)
++{
++	va_list list;
++
++	if ((ath10k_debug_mask & mask) == 0) {
++		return;
++	}
++	va_start(list, format);
++	says_about_v(ar, format, list);
++	va_end(list);
++}
++
++void
++ath10k_dbg_dump(struct ath10k *ar, enum ath10k_debug_mask mask, const char *message,
++    const char *prefix, const void *buffer, size_t length)
++{
++	size_t i;
++	unsigned j;
++
++	if ((ath10k_debug_mask & mask) == 0) {
++		return;
++	}
++	if (message != NULL && message[0] != '\0') {
++		says("%s (%lu bytes)", message, (unsigned long)length);
++	}
++	for (i = 0; i < length; i += 16) {
++		char line[72];
++		int n;
++
++		n = snprintf(line, sizeof(line), "%s%04lx:", prefix != NULL ? prefix : "", (unsigned long)i);
++		for (j = 0; j < 16 && i + j < length; j++) {
++			n += snprintf(line + n, sizeof(line) - n, "%s%02x", j == 8 ? "  " : " ",
++			    ((const unsigned char *)buffer)[i + j]);
++		}
++		printf("%s\n", line);
++	}
++}
++
++/* ---- what the driver's own table of this chip says --------------------------------------------- */
++
++/*
++ * snoc.c keeps its own table of the chips it knows in its probe: it is what
++ * device_get_match_data() is asked for. This is its entry for the WCN3990, as it is there.
++ */
++static const struct ath10k_snoc_drv_priv drv_priv_lx = {
++	.hw_rev = ATH10K_HW_WCN3990,
++	.dma_mask = DMA_BIT_MASK(35),
++	.msa_size = 0x100000,
++};
++
++const void *
++device_get_match_data(struct device *dev)
++{
++
++	return (&drv_priv_lx);
++}
++
++const void *
++of_device_get_match_data(struct device *dev)
++{
++
++	return (device_get_match_data(dev));
++}
++
++int
++device_property_read_u32(struct device *dev, const char *name, u32 *value)
++{
++	const void *property;
++	int length;
++
++	if (dev == NULL || dev->of_node == NULL ||
++	    (property = of_get_property(dev->of_node, name, &length)) == NULL ||
++	    length != (int)sizeof(u32)) {
++		return (-EINVAL);
++	}
++	*value = *(const u32 *)property;
++	return (0);
++}
++
++int
++device_property_read_string(struct device *dev, const char *name, const char **value)
++{
++	const void *property;
++
++	if (dev == NULL || dev->of_node == NULL ||
++	    (property = of_get_property(dev->of_node, name, NULL)) == NULL) {
++		return (-EINVAL);
++	}
++	*value = property;
++	return (0);
++}
++
++bool
++device_property_present(struct device *dev, const char *name)
++{
++
++	return (dev != NULL && dev->of_node != NULL &&
++	    of_find_property(dev->of_node, name, NULL) != NULL);
++}
++
++/* ---- the machine's word of the radio ----------------------------------------------------------- */
++
++/*
++ * The one thing the driver reads of the device's node is what it is ("qcom,wcn3990-wifi"): its
++ * calibration comes from its file (the machine's own, taken where lx_os_firmware() reads), for
++ * there is no one-time memory of the phone to ask.
++ */
++static const struct property radio_properties[] = {
++	{ .name = "compatible", .length = (int)sizeof("qcom,wcn3990-wifi"), .value = "qcom,wcn3990-wifi" },
++};
++
++static struct device_node radio_node = {
++	.name = "wifi",
++	.full_name = "wlan@18800000",
++	.properties = radio_properties,
++	.nproperties = (int)(sizeof(radio_properties) / sizeof(radio_properties[0])),
++};
++
++/*
++ * The radio's registers, in the SoC's map, as the table of the machine has them for the WCN3990
++ * (the node's one span, named "membase"), and its eleven interrupts, one for each copy engine,
++ * in the order the driver asks for them (the table of their names is in snoc.h). The kernel's
++ * vectors are what the driver's handlers are taken care on: the radio's line 0 is the kernel's
++ * vector 0, and so on.
++ */
++static struct resource radio_resources[] = {
++	{ .name = "membase", .start = 0x18800000, .end = 0x18800000 + 0x00800000 - 1,
++	  .flags = IORESOURCE_MEM },
++};
++
++static struct platform_device radio_platform_device;
++
++const struct property *
++of_find_property(const struct device_node *np, const char *name, int *lenp)
++{
++	int i;
++
++	if (np == NULL) {
++		return (NULL);
++	}
++	for (i = 0; i < np->nproperties; i++) {
++		if (strcmp(np->properties[i].name, name) == 0) {
++			if (lenp != NULL) {
++				*lenp = np->properties[i].length;
++			}
++			return (&np->properties[i]);
++		}
++	}
++	return (NULL);
++}
++
++const void *
++of_get_property(const struct device_node *np, const char *name, int *lenp)
++{
++	const struct property *property;
++
++	if ((property = of_find_property(np, name, lenp)) == NULL) {
++		return (NULL);
++	}
++	return (property->value);
++}
++
++bool
++of_device_is_compatible(const struct device_node *np, const char *compatible)
++{
++	const char *value;
++
++	if ((value = of_get_property(np, "compatible", NULL)) == NULL) {
++		return (false);
++	}
++	return (strcmp(value, compatible) == 0);
++}
++
++struct device_node *
++of_get_child_by_name(const struct device_node *np, const char *name)
++{
++
++	return (NULL);					/* (the radio's node has no children: nothing reads one) */
++}
++
++int
++of_property_read_string(const struct device_node *np, const char *name, const char **out)
++{
++	const void *property;
++
++	if (np == NULL || (property = of_get_property(np, name, NULL)) == NULL) {
++		return (-EINVAL);
++	}
++	*out = property;
++	return (0);
++}
++
++int
++of_property_read_string_index(const struct device_node *np, const char *name, int index,
++    const char **out)
++{
++	const void *property;
++	int length;
++
++	if (np == NULL || (property = of_get_property(np, name, &length)) == NULL ||
++	    length < (index + 1) * (int)sizeof(const char *)) {
++		return (-EINVAL);
++	}
++	*out = ((const char *const *)property)[index];
++	return (0);
++}
++
++const struct of_device_id *
++of_match_node(const struct of_device_id *matches, const struct device_node *np)
++{
++	const char *compatible;
++
++	if ((compatible = of_get_property(np, "compatible", NULL)) == NULL) {
++		return (NULL);
++	}
++	for (; matches->compatible[0] != '\0'; matches++) {
++		if (strcmp(matches->compatible, compatible) == 0) {
++			return (matches);
++		}
++	}
++	return (NULL);
++}
++
++int
++of_address_to_resource(const struct device_node *np, int index, struct resource *res)
++{
++
++	if (index != 0) {
++		return (-EINVAL);
++	}
++	*res = radio_resources[0];
++	return (0);
++}
++
++/*
++ * What else the driver reads of its node: the cells of a property, one at a time or as an array
++ * of bytes (the calibration's kind). What the node does not say is answered so.
++ */
++int
++of_property_read_u32_index(const struct device_node *np, const char *name, u32 index, u32 *out)
++{
++	const void *property;
++	int length;
++
++	if (np == NULL || (property = of_get_property(np, name, &length)) == NULL ||
++	    length < (int)((index + 1) * sizeof(u32))) {
++		return (-EINVAL);
++	}
++	*out = ((const u32 *)property)[index];
++	return (0);
++}
++
++int
++of_property_read_u8_array(const struct device_node *np, const char *name, u8 *out, size_t count)
++{
++	const void *property;
++	int length;
++
++	if (np == NULL || (property = of_get_property(np, name, &length)) == NULL ||
++	    length < (int)count) {
++		return (-EINVAL);
++	}
++	memcpy(out, property, count);
++	return (0);
++}
++
++/* ---- the platform device, as the machine would have said it ------------------------------------ */
++
++struct resource *
++platform_get_resource(struct platform_device *pdev, unsigned type, unsigned num)
++{
++	unsigned i;
++
++	for (i = 0; i < pdev->num_resources; i++) {
++		if ((pdev->resource[i].flags & type) != 0 && num-- == 0) {
++			return (&pdev->resource[i]);
++		}
++	}
++	return (NULL);
++}
++
++struct resource *
++platform_get_resource_byname(struct platform_device *pdev, unsigned type, const char *name)
++{
++	unsigned i;
++
++	for (i = 0; i < pdev->num_resources; i++) {
++		if ((pdev->resource[i].flags & type) != 0 && pdev->resource[i].name != NULL &&
++		    strcmp(pdev->resource[i].name, name) == 0) {
++			return (&pdev->resource[i]);
++		}
++	}
++	return (NULL);
++}
++
++int
++platform_get_irq(struct platform_device *pdev, unsigned num)
++{
++
++	if (num >= CE_COUNT_MAX) {
++		return (-ENXIO);
++	}
++	return ((int)num);
++}
++
++void
++platform_set_drvdata(struct platform_device *pdev, void *data)
++{
++
++	pdev->dev.driver_data = data;
++}
++
++void *
++platform_get_drvdata(struct platform_device *pdev)
++{
++
++	return (pdev->dev.driver_data);
++}
++
++/*
++ * The driver's own file says itself as a driver (its module_platform_driver()): its
++ * registration is kept here, for lx_start() to give its probe the device the way the bus
++ * would have.
++ */
++static struct platform_driver *radio_driver;
++
++int
++platform_driver_register(struct platform_driver *pdrv)
++{
++
++	radio_driver = pdrv;
++	return (0);
++}
++
++void
++platform_driver_unregister(struct platform_driver *pdrv)
++{
++
++	if (radio_driver == pdrv) {
++		radio_driver = NULL;
++	}
++}
++
++struct platform_device *
++platform_device_register_full(struct platform_device_info *info)
++{
++
++	return (ERR_PTR(-ENODEV));			/* (only the firmware's device is asked for, and there is none) */
++}
++
++/* ---- what the driver asks to keep as long as its device is there ------------------------------- */
++
++struct devres {
++	struct devres *next;
++	void (*release)(struct device *, void *);
++	size_t size;
++};
++
++#define DEVRES_OF(memory)	((struct devres *)((char *)memory - sizeof(struct devres)))
++
++static struct devres *radio_devres;			/* (there is one radio, and its memory with it) */
++
++static void
++devres_release_all(void)
++{
++	struct devres *devres, *next;
++
++	lx_os_lock();
++	devres = radio_devres;
++	radio_devres = NULL;
++	lx_os_unlock();
++	for (; devres != NULL; devres = next) {
++		next = devres->next;
++		if (devres->release != NULL) {
++			(devres->release)(NULL, (char *)devres + sizeof(*devres));
++		}
++		lx_os_free(devres, sizeof(*devres) + devres->size);
++	}
++}
++
++void *
++lkpi_devres_alloc(void (*release)(struct device *, void *), size_t size, gfp_t flags)
++{
++	struct devres *devres;
++
++	if ((devres = lx_os_alloc(sizeof(*devres) + size)) == NULL) {
++		return (NULL);
++	}
++	devres->release = release;
++	devres->size = size;
++	return ((char *)devres + sizeof(*devres));
++}
++
++void
++lkpi_devres_add(struct device *dev, void *memory)
++{
++	struct devres *devres = DEVRES_OF(memory);
++
++	lx_os_lock();
++	devres->next = radio_devres;
++	radio_devres = devres;
++	lx_os_unlock();
++}
++
++void
++lkpi_devres_free(void *memory)
++{
++	struct devres *devres;
++
++	if (memory == NULL) {
++		return;
++	}
++	devres = DEVRES_OF(memory);
++	lx_os_free(devres, sizeof(*devres) + devres->size);
++}
++
++void *
++lkpi_devres_find(struct device *dev, void (*release)(struct device *, void *),
++    int (*match)(struct device *, void *, void *), void *match_data)
++{
++	struct devres *devres;
++
++	lx_os_lock();
++	for (devres = radio_devres; devres != NULL; devres = devres->next) {
++		if (devres->release == release &&
++		    (match == NULL || (match)(NULL, (char *)devres + sizeof(*devres), match_data))) {
++			lx_os_unlock();
++			return ((char *)devres + sizeof(*devres));
++		}
++	}
++	lx_os_unlock();
++	return (NULL);
++}
++
++int
++lkpi_devres_destroy(struct device *dev, void (*release)(struct device *, void *),
++    int (*match)(struct device *, void *, void *), void *match_data)
++{
++	struct devres **devresp, *devres;
++
++	lx_os_lock();
++	for (devresp = &radio_devres; (devres = *devresp) != NULL; devresp = &devres->next) {
++		if (devres->release == release &&
++		    (match == NULL || (match)(NULL, (char *)devres + sizeof(*devres), match_data))) {
++			*devresp = devres->next;
++			lx_os_unlock();
++			if (release != NULL) {
++				(release)(NULL, (char *)devres + sizeof(*devres));
++			}
++			lx_os_free(devres, sizeof(*devres) + devres->size);
++			return (1);
++		}
++	}
++	lx_os_unlock();
++	return (0);
++}
++
++/*
++ * The driver's memory that lives as long as its device does is devm_kmalloc()'s, which the
++ * device's header keeps in its own list: what is asked for here is only the freeing of it,
++ * where the driver gives a piece back before its device goes, and the no-op that the memory
++ * is not done anything with when the device does.
++ */
++void
++lkpi_devm_kmalloc_release(struct device *dev, void *memory)
++{
++}
++
++void
++lkpi_devm_kfree(struct device *dev, const void *memory)
++{
++	struct devres **devresp, *devres;
++
++	if (memory == NULL) {
++		return;
++	}
++	lx_os_lock();
++	for (devresp = &radio_devres; (devres = *devresp) != NULL; devresp = &devres->next) {
++		if ((char *)devres + sizeof(*devres) == memory) {
++			*devresp = devres->next;
++			lx_os_unlock();
++			lx_os_free(devres, sizeof(*devres) + devres->size);
++			return;
++		}
++	}
++	lx_os_unlock();
++}
++
++/* ---- the radio's supplies, clocks and power sequence ------------------------------------------- */
++
++/*
++ * The kernel has made the radio ready before the driver starts: what a regulator is asked to do
++ * has been done, what a clock is asked to run is running, and the power sequence is past. The
++ * driver's asks are answered so that it may see it so.
++ */
++struct regulator *
++regulator_get(struct device *dev, const char *id)
++{
++
++	return ((struct regulator *)1);
++}
++
++struct regulator *
++devm_regulator_get(struct device *dev, const char *id)
++{
++
++	return ((struct regulator *)1);
++}
++
++void
++regulator_put(struct regulator *regulator)
++{
++}
++
++int
++regulator_enable(struct regulator *regulator)
++{
++
++	return (0);
++}
++
++int
++regulator_disable(struct regulator *regulator)
++{
++
++	return (0);
++}
++
++int
++regulator_set_voltage(struct regulator *regulator, int min_uV, int max_uV)
++{
++
++	return (0);
++}
++
++int
++regulator_set_load(struct regulator *regulator, int load_uA)
++{
++
++	return (0);
++}
++
++int
++regulator_set_optimum_mode(struct regulator *regulator, int load_uA)
++{
++
++	return (regulator_set_load(regulator, load_uA));
++}
++
++int
++regulator_bulk_get(struct device *dev, int count, struct regulator_bulk_data *supplies)
++{
++	int i;
++
++	for (i = 0; i < count; i++) {
++		supplies[i].regulator = (struct regulator *)1;
++	}
++	return (0);
++}
++
++int
++regulator_bulk_enable(int count, struct regulator_bulk_data *supplies)
++{
++
++	return (0);
++}
++
++int
++regulator_bulk_disable(int count, struct regulator_bulk_data *supplies)
++{
++
++	return (0);
++}
++
++void
++regulator_bulk_free(int count, struct regulator_bulk_data *supplies)
++{
++}
++
++int
++devm_regulator_bulk_get(struct device *dev, int count, struct regulator_bulk_data *supplies)
++{
++
++	return (regulator_bulk_get(dev, count, supplies));
++}
++
++struct clk *
++clk_get(struct device *dev, const char *id)
++{
++
++	return ((struct clk *)1);
++}
++
++void
++clk_put(struct clk *clk)
++{
++}
++
++unsigned long
++clk_get_rate(struct clk *clk)
++{
++
++	return (0);
++}
++
++int
++clk_bulk_get(struct device *dev, int count, struct clk_bulk_data *clks)
++{
++	int i;
++
++	for (i = 0; i < count; i++) {
++		clks[i].clk = (struct clk *)1;
++	}
++	return (0);
++}
++
++void
++clk_bulk_put(int count, struct clk_bulk_data *clks)
++{
++}
++
++int
++devm_clk_bulk_get_optional(struct device *dev, int count, struct clk_bulk_data *clks)
++{
++
++	return (clk_bulk_get(dev, count, clks));
++}
++
++unsigned long
++clk_bulk_get_rate(struct device *dev, struct clk_bulk_data *clks, const char *id)
++{
++
++	return (0);
++}
++
++struct pwrseq *
++devm_pwrseq_get(struct device *dev, const char *id)
++{
++
++	return ((struct pwrseq *)1);
++}
++
++int
++pwrseq_power_on(struct pwrseq *pwrseq)
++{
++
++	return (0);
++}
++
++int
++pwrseq_power_off(struct pwrseq *pwrseq)
++{
++
++	return (0);
++}
++
++/*
++ * What else of Linux's face the driver's files need, that neither the kernel nor the lx layer
++ * has yet: what the driver would have read of the machine (there is nothing to read, and its
++ * asks are answered so), and what the driver's own files would have had from the parts of
++ * Linux's drivers that are not built (a copy of a frame; the table of the kind of frames).
++ */
++const unsigned char rfc1042_header[6] = { 0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00 };
++
++int
++clk_bulk_prepare_enable(int count, struct clk_bulk_data *clks)
++{
++
++	return (0);
++}
++
++void
++clk_bulk_disable_unprepare(int count, struct clk_bulk_data *clks)
++{
++}
++
++int
++of_reserved_mem_region_to_resource(const struct device_node *np, unsigned int index,
++    struct resource *res)
++{
++
++	return (-ENOENT);			/* (there is no region of the machine's own reserved) */
++}
++
++int
++linux_dma_tag_init(struct device *dev, u64 mask)
++{
++
++	return (0);
++}
++
++int
++linux_dma_tag_init_coherent(struct device *dev, u64 mask)
++{
++
++	return (0);
++}
++
++void *
++linuxkpi_dmam_alloc_coherent(struct device *dev, size_t size, dma_addr_t *dma_handle, gfp_t flag)
++{
++
++	return (linux_dma_alloc_coherent(dev, size, dma_handle, flag));
++}
++
++struct net_device *
++linuxkpi_alloc_netdev(size_t sizeof_priv, const char *name, uint32_t name_assign_type,
++    void (*setup)(struct net_device *))
++{
++	struct net_device *dev;
++
++	if ((dev = lx_os_alloc(sizeof(*dev) + sizeof_priv)) == NULL) {
++		return (NULL);
++	}
++	memset(dev, 0, sizeof(*dev));
++	if (setup != NULL) {
++		(setup)(dev);
++	}
++	return (dev);
++}
++
++void
++linuxkpi_free_netdev(struct net_device *dev)
++{
++
++	if (dev != NULL) {
++		lx_os_free(dev, 0);
++	}
++}
++
++struct sk_buff *
++linuxkpi_skb_copy(const struct sk_buff *skb, gfp_t gfp)
++{
++	struct sk_buff *copy;
++
++	if ((copy = __dev_alloc_skb(skb->len, gfp)) == NULL) {
++		return (NULL);
++	}
++	memcpy(skb_put(copy, skb->len), skb->data, skb->len);
++	return (copy);
++}
++
++static struct linuxkpi_ieee80211_regdomain radio_regdomain = {
++	.alpha2 = "00",				/* (the world: the machine has said no country) */
++};
++
++struct linuxkpi_ieee80211_regdomain *
++lkpi_get_linuxkpi_ieee80211_regdomain(size_t unused)
++{
++
++	return (&radio_regdomain);
++}
++
++/*
++ * The machine's advanced configuration and power interface, as the driver's mac.c asks for it
++ * (the WRDD table of what power the radio may use, an x86 thing): there is none of it under
++ * XNU, and the driver's asking is answered "it is not there", so it takes its default.
++ */
++#include <linux/acpi.h>
++
++void *
++bsd_acpi_get_handle(device_t dev)
++{
++
++	return (NULL);
++}
++
++acpi_status
++AcpiGetHandle(acpi_handle parent, const char *pathname, acpi_handle *out_handle)
++{
++
++	return (AE_NOT_FOUND);
++}
++
++acpi_status
++AcpiEvaluateObject(acpi_handle object, acpi_string pathname, struct acpi_object_list *arguments,
++    struct acpi_buffer *return_buffer)
++{
++
++	return (AE_NOT_FOUND);
++}
++
++/*
++ * The driver's queueing of its frames for the air (mac80211's TXQ) and its polling of the copy
++ * engines' rings (NAPI) are the next stage's work: for now the asks are answered with "there is
++ * nothing queued" -- the control path of the radio does not go through either of them, and the
++ * frames of the air wait for the stage that carries them.
++ */
++uint8_t
++linuxkpi_ieee80211_get_tid(struct ieee80211_hdr *hdr, bool is_qos)
++{
++
++	return (0);
++}
++
++struct sk_buff *
++linuxkpi_ieee80211_tx_dequeue(struct ieee80211_hw *hw, struct ieee80211_txq *txq)
++{
++
++	return (NULL);
++}
++
++void
++linuxkpi_ieee80211_txq_get_depth(struct ieee80211_txq *txq, unsigned long *frames,
++    unsigned long *bytes)
++{
++
++	if (frames != NULL) {
++		*frames = 0;
++	}
++	if (bytes != NULL) {
++		*bytes = 0;
++	}
++}
++
++void
++linuxkpi_ieee80211_stop_queue(struct ieee80211_hw *hw, int queue)
++{
++}
++
++void
++linuxkpi_ieee80211_wake_queue(struct ieee80211_hw *hw, int queue)
++{
++}
++
++void
++linuxkpi_ieee80211_txq_schedule_start(struct ieee80211_hw *hw, uint8_t ac)
++{
++}
++
++struct ieee80211_txq *
++linuxkpi_ieee80211_next_txq(struct ieee80211_hw *hw, uint8_t ac)
++{
++
++	return (NULL);
++}
++
++void
++linuxkpi_ieee80211_schedule_txq(struct ieee80211_hw *hw, struct ieee80211_txq *txq, bool force)
++{
++}
++
++void
++linuxkpi_netif_napi_add(struct net_device *dev, struct napi_struct *napi,
++    int (*napi_poll)(struct napi_struct *, int))
++{
++}
++
++void
++linuxkpi_netif_napi_del(struct napi_struct *napi)
++{
++}
++
++bool
++linuxkpi_napi_schedule(struct napi_struct *napi)
++{
++
++	return (false);
++}
++
++bool
++linuxkpi_napi_complete(struct napi_struct *napi)
++{
++
++	return (false);
++}
++
++void
++linuxkpi_napi_enable(struct napi_struct *napi)
++{
++}
++
++void
++linuxkpi_napi_disable(struct napi_struct *napi)
++{
++}
++
++void
++linuxkpi_napi_synchronize(struct napi_struct *napi)
++{
++}
++
++/*
++ * The rate of a connection, as the kernel's list of networks would say it: what the driver has
++ * said of the rate, in the kernel's tenth of a kilobit a second.
++ */
++uint32_t
++linuxkpi_cfg80211_calculate_bitrate(struct rate_info *rate)
++{
++
++	if (rate->flags == 0) {
++		return (rate->legacy);
++	}
++	return (0);
++}
++
++int
++linuxkpi_device_get_mac_address(struct device *dev, char *dst)
++{
++
++	return (-ENOENT);			/* (the machine has no address to give; the calibration file has one) */
++}
++
++/* ---- the driver's interrupts ------------------------------------------------------------------- */
++/*
++ * What the driver asks for its copy engines' interrupts, on the kernel's vectors: a handler is
++ * taken on masked, is let in with enable_irq() where the driver turns an engine's own on, and is
++ * quieted with disable_irq() (which returns when no run of it is under way).
++ */
++#define RADIO_IRQ_COUNT		CE_COUNT_MAX
++
++static irq_handler_t radio_irq_handler[RADIO_IRQ_COUNT];
++static void *radio_irq_argument[RADIO_IRQ_COUNT];
++
++static void
++radio_irq(void *argument)
++{
++	unsigned vector = (unsigned)(uintptr_t)argument;
++
++	if (vector < RADIO_IRQ_COUNT && radio_irq_handler[vector] != NULL) {
++		(radio_irq_handler[vector])((int)vector, radio_irq_argument[vector]);
++	}
++}
++
++int
++lkpi_request_irq(struct device *dev, unsigned int irq, irq_handler_t handler,
++    irq_handler_t thread_handler, unsigned long flags, const char *name, void *argument)
++{
++
++	if (irq >= RADIO_IRQ_COUNT || handler == NULL) {
++		return (-EINVAL);
++	}
++	if (lx_os_irq_attach(irq, radio_irq, (void *)(uintptr_t)irq) != 0) {
++		return (-EINVAL);
++	}
++	radio_irq_handler[irq] = handler;
++	radio_irq_argument[irq] = argument;
++	return (0);
++}
++
++void
++lkpi_free_irq(unsigned int irq, void *argument)
++{
++
++	if (irq < RADIO_IRQ_COUNT) {
++		radio_irq_handler[irq] = NULL;
++		radio_irq_argument[irq] = NULL;
++		lx_os_irq_disable(irq);
++	}
++}
++
++int
++lkpi_enable_irq(unsigned int irq)
++{
++
++	lx_os_irq_enable(irq);
++	return (0);
++}
++
++void
++lkpi_disable_irq(unsigned int irq)
++{
++
++	lx_os_irq_disable(irq);
++}
++
++/* ---- what the driver asks of the machine's other parts ----------------------------------------- */
++
++/*
++ * The radio's addresses are what they are (there is no SMMU to be told of them): what the
++ * driver asks of one is answered "it is so". What it asks of the machine's secure monitor --
++ * the handing over of the firmware's memory to the modem -- is granted here for now; what that
++ * needs of the kernel is the next stage's.
++ */
++int
++of_dma_configure(struct device *dev, struct device_node *np, bool coherent)
++{
++
++	return (0);
++}
++
++struct iommu_domain *
++iommu_paging_domain_alloc(struct device *dev)
++{
++	struct iommu_domain *domain;
++
++	if ((domain = lx_os_alloc(sizeof(*domain))) == NULL) {
++		return (NULL);
++	}
++	domain->type = 0;
++	return (domain);
++}
++
++int
++iommu_attach_device(struct iommu_domain *domain, struct device *dev)
++{
++
++	return (0);
++}
++
++void
++iommu_detach_device(struct iommu_domain *domain, struct device *dev)
++{
++}
++
++int
++iommu_map(struct iommu_domain *domain, unsigned long iova, unsigned long long physical,
++    size_t size, int protection, gfp_t gfp)
++{
++
++	return (0);
++}
++
++size_t
++iommu_unmap(struct iommu_domain *domain, unsigned long iova, size_t size)
++{
++
++	return (size);
++}
++
++void
++iommu_domain_free(struct iommu_domain *domain)
++{
++
++	lx_os_free(domain, sizeof(*domain));
++}
++
++int
++qcom_scm_assign_mem(unsigned long long address, unsigned long long size, const unsigned *src_vmid,
++    const struct qcom_scm_vmperm *newvm, unsigned int count)
++{
++	struct lx_os_scm_grant grants[8];
++	unsigned i;
++	int error;
++
++	if (count > 8) {
++		return (-EINVAL);
++	}
++	says("qcom_scm_assign_mem(%#llx, %llu):", address, size);
++	for (i = 0; i < count; i++) {
++		printf(" vmid %u perm %u", newvm[i].vmid, newvm[i].perm);
++		grants[i].identity = (unsigned char)newvm[i].vmid;
++		grants[i].rights = (unsigned char)newvm[i].perm;
++	}
++	printf("\n");
++	error = lx_os_scm_assign(address, size, *src_vmid, grants, count);
++	if (error != 0) {
++		return (-error);
++	}
++	return (0);
++}
++
++/*
++ * The one span of the radio's one-time memory there is none of: what would map it is said not
++ * to be there, and the memory the firmware is worked in is taken from the kernel's own instead.
++ */
++void *
++devm_memremap(struct device *dev, unsigned long long offset, size_t size, unsigned long flags)
++{
++
++	return (ERR_PTR(-ENODEV));
++}
++
++/* ---- the kernel's entrance --------------------------------------------------------------------- */
++
++static struct ath10k *driver;				/* (the radio the driver has taken up) */
++
++/* lx_prepare(): the memory the radio is shown: once. 0, or an errno. */
++int
++lx_prepare(void)
++{
++
++	return (lx_base_init() != 0 || lx_pool_init() != 0 ? ENOMEM : 0);
++}
++
++int
++lx_start(void)
++{
++	struct platform_device *pdev = &radio_platform_device;
++	struct device *dev = &pdev->dev;
++	struct ath10k *ar;
++	unsigned long long began, now;
++	int ret;
++
++	ath10k_debug_mask = lx_os_option("wifi_debug");
++
++	/*
++	 * The device the driver's probe is given: the radio's node and its resources, and
++	 * nothing else of what Linux would have built around it.
++	 */
++	memset(pdev, 0, sizeof(*pdev));
++	pdev->name = "wcn3990-wifi";
++	pdev->id = -1;
++	pdev->resource = radio_resources;
++	pdev->num_resources = sizeof(radio_resources) / sizeof(radio_resources[0]);
++	dev->of_node = &radio_node;
++	dev->driver_data = NULL;
++
++	/*
++	 * The driver's own file has said itself as a driver; its probe is given the device the
++	 * way the bus would have. From it, ath10k's core takes the radio up with it: its copy
++	 * engines, its QMI, and its firmware -- and the driver's threads carry it from here, to
++	 * the flag core.c sets when it has been through its start. The radio is up if the flag
++	 * is there within the minute.
++	 */
++	if (radio_driver == NULL || radio_driver->probe == NULL) {
++		says("the driver has not said itself as a driver\n");
++		return (EIO);
++	}
++	began = lx_os_nanoseconds();
++	if ((ret = (radio_driver->probe)(dev)) != 0) {
++		says("the driver's probe would not have the radio: %d\n", ret);
++		devres_release_all();
++		return (-ret);
++	}
++	ar = dev_get_drvdata(dev);
++	says("%llu ms after its probe the driver is working on the radio\n",
++	    (lx_os_nanoseconds() - began) / 1000000ull);
++
++	while (ar != NULL && !test_bit(ATH10K_FLAG_CORE_REGISTERED, &ar->dev_flags) &&
++	    lx_os_nanoseconds() - began < 60000000000ull) {
++		lx_pause_ms(10);
++	}
++	now = lx_os_nanoseconds();
++	if (ar == NULL || !test_bit(ATH10K_FLAG_CORE_REGISTERED, &ar->dev_flags)) {
++		says("%llu ms after its start the driver HAS NOT GOT THROUGH %s\n", (now - began) / 1000000ull,
++		    ar != NULL ? "its start: what it says is in the log" : "(it gave the radio back)");
++		lx_stop();
++		return (EIO);
++	}
++	says("%llu ms after its start the radio IS UP as far as it is built\n", (now - began) / 1000000ull);
++	lx_pause_ms(1000);				/* (for what the firmware says unasked once it is ready) */
++
++	driver = ar;
++	if (lx_os_option("wifi_station")) {
++		/* whoever wants a network asks the kernel, and the kernel asks the station: the driver stays up until lx_stop() */
++		if ((ret = lx_station_offer()) == 0) {
++			return (0);
++		}
++	} else if (lx_os_option("wifi_join")) {
++		if ((ret = lx_station_join()) == 0) {
++			if (lx_os_option("wifi_hold")) {	/* (seconds to stay before returning: to see frames pass) */
++				lx_pause_ms(1000 * lx_os_option("wifi_hold"));
++				lx_station_say();
++			}
++			return (0);			/* the network is joined, and the driver stays up until lx_stop() */
++		}
++	} else {
++		ret = lx_os_option("wifi_scan") ? lx_station_scan() : 0;
++	}
++	lx_stop();
++	return (ret);
++}
++
++/* The network left, and the driver down as its own removal does it (its devres is let go of there). */
++void
++lx_stop(void)
++{
++	struct ath10k *ar = driver;
++
++	if (ar == NULL) {
++		return;
++	}
++	driver = NULL;
++	lx_station_withdraw();
++	lx_station_leave();
++	if (radio_driver != NULL && radio_driver->remove != NULL) {
++		(radio_driver->remove)(&radio_platform_device);	/* (its own removal) */
++	}
++	devres_release_all();
++	says("the driver is down again\n");
++}
++
++int
++lx_transmit(const unsigned char *frame, unsigned long length)
++{
++
++	return (driver != NULL ? lx_station_send(frame, length) : ENETDOWN);
++}
+diff --git a/wifi/lx/src/lx_base.c b/wifi/lx/src/lx_base.c
+index df4daee..0f16525 100644
+--- a/wifi/lx/src/lx_base.c
++++ b/wifi/lx/src/lx_base.c
+@@ -366,6 +366,51 @@ lx_pause_ms(unsigned ms)
+ 	lx_os_unlock();
+ }
+ 
++/*
++ * FreeBSD's own names, which LinuxKPI's headers say where the driver reaches the paths of theirs
++ * ours does not cover: the waiting of Linux (taken as a sleep, for the driver runs on threads
++ * only), the sleep of FreeBSD's slice of a second, and the saying of a message against a device
++ * (there is no name of a device to say here, so the message alone is said).
++ */
++void
++DELAY(int usec)
++{
++	static char nothing;
++
++	lx_os_lock();
++	lx_os_sleep(&nothing, (unsigned long long)usec * 1000ull);
++	lx_os_unlock();
++}
++
++int
++pause_sbt(const char *what, sbintime_t sbt, sbintime_t pri, int flags)
++{
++	static char nothing;
++
++	(void)what;
++	(void)pri;
++	(void)flags;
++	lx_os_lock();
++	lx_os_sleep(&nothing, ((unsigned long long)sbt * 1000000000ull) >> 32);
++	lx_os_unlock();
++	return (0);
++}
++
++int
++device_printf(device_t dev, const char *format, ...)
++{
++	char line[256];
++	va_list list;
++	int said;
++
++	(void)dev;
++	va_start(list, format);
++	said = vsnprintf(line, sizeof(line), format, list);
++	va_end(list);
++	printf("%s", line);
++	return (said);
++}
++
+ void
+ callout_init(struct callout *c, int mpsafe)
+ {
+diff --git a/xnu-build.sh b/xnu-build.sh
+index 01ba6a2..3519e26 100755
+--- a/xnu-build.sh
++++ b/xnu-build.sh
+@@ -1,10 +1,16 @@
+ #!/bin/bash
+ # Build XNU for redwood on Linux. Extra make args are passed through.
++# unset: the tools this runs pick up a wrong liblzma (and libstdc++) from the environment otherwise
++unset LD_LIBRARY_PATH LD_PRELOAD
+ source "$(dirname "${BASH_SOURCE[0]}")/xnu-env.sh"
+ cd "$XNU_SRC" || exit 1
+-# The Wi-Fi driver's object (tools/mk-ath11k.sh) is linked into the kernel when it is there; make
+-# does not see it change, so the linked kernel is thrown away when it has.
+-LX=$XNUDEPS/build/ath11k/out/ath11k.o
++# The Wi-Fi driver's object is linked into the kernel when it is there -- tools/mk-ath11k.sh's by
++# default, tools/mk-ath10k.sh's with REDWOOD_WIFI=ath10k; make does not see it change, so the
++# linked kernel is thrown away when it has.
++case "$REDWOOD_WIFI" in
++ath10k) LX=$XNUDEPS/build/ath10k/out/ath10k.o ;;
++*)	LX=$XNUDEPS/build/ath11k/out/ath11k.o ;;
++esac
+ STAMP=BUILD/obj/redwood-objects
+ if [ -f "$LX" ]; then now="$LX $(stat -c %Y "$LX")"; else LX= now=; fi
+ if [ -d BUILD/obj ] && [ "$(cat $STAMP 2>/dev/null)" != "$now" ]; then
+-- 
+2.53.0
+
